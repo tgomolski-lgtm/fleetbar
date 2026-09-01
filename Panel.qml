@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Layouts
 import Quickshell
 import Quickshell.Io
 import qs.Commons
@@ -49,9 +50,16 @@ Panel {
     return summary.severity
   }
 
+  // ---- Palette (first-party panel idiom) --------------------------------
+
+  readonly property color panelFg: Color.popups.text
+  readonly property color dim: Qt.darker(panelFg, 1.55)
+  readonly property color rowFill: Style.hoverFillFor(panelFg, Color.accent)
+
   // ---- Bar face ---------------------------------------------------------
 
-  readonly property string barGlyph: ""
+  // nf-fa-server, written as an escape so tooling can never eat the PUA char.
+  readonly property string barGlyph: "\uf233"
   readonly property string barLabel: {
     if (!report && collectorError !== "") return "!"
     return Model.barLabel(summary, showLabel)
@@ -265,8 +273,8 @@ Panel {
     open: root.opened
     centerOnBar: true
     focusTarget: keyCatcher
-    contentWidth: panel.fittedContentWidth(Style.space(400))
-    contentHeight: panel.fittedContentHeight(fleetColumn.implicitHeight + Style.space(28))
+    contentWidth: panel.fittedContentWidth(Style.space(420))
+    contentHeight: panel.fittedContentHeight(fleetColumn.implicitHeight + Style.space(32))
 
     PanelKeyCatcher {
       id: keyCatcher
@@ -277,7 +285,7 @@ Panel {
       Flickable {
         id: fleetScroll
         anchors.fill: parent
-        anchors.margins: Style.space(14)
+        anchors.margins: Style.space(16)
         contentWidth: width
         contentHeight: fleetColumn.implicitHeight
         clip: true
@@ -287,63 +295,122 @@ Panel {
         Column {
           id: fleetColumn
           width: fleetScroll.width
-          spacing: Style.space(12)
+          spacing: Style.space(10)
 
-          // ---- Hero: glyph + fleet name + summary; dashboard shortcut.
+          // ---- Hero: big glyph + live counts on the left, fleet identity
+          //      and actions on the right (weather-hero idiom).
           Item {
             width: parent.width
-            height: heroRow.implicitHeight
+            height: Math.max(heroLeft.implicitHeight, heroRight.implicitHeight) + Style.space(6)
 
             Row {
-              id: heroRow
-              spacing: Style.space(10)
+              id: heroLeft
+              anchors.left: parent.left
+              anchors.leftMargin: Style.space(4)
+              anchors.verticalCenter: parent.verticalCenter
+              spacing: Style.space(14)
 
               Text {
+                id: heroGlyph
                 text: root.barGlyph
-                color: root.severityColor(root.severity, Color.popups.text)
+                color: root.severityColor(root.severity, root.panelFg)
                 font.family: root.bar ? root.bar.fontFamily : Style.font.family
-                font.pixelSize: Style.font.display
+                // Hero mark; deliberately outside the Style.font.* scale,
+                // like the weather hero's condition glyph.
+                font.pixelSize: 44
                 anchors.verticalCenter: parent.verticalCenter
+
+                // Critical state breathes; calm states hold still.
+                SequentialAnimation on opacity {
+                  running: root.severity === "crit" && root.opened
+                  loops: Animation.Infinite
+                  NumberAnimation { to: 0.45; duration: 700; easing.type: Easing.InOutSine }
+                  NumberAnimation { to: 1.0; duration: 700; easing.type: Easing.InOutSine }
+                  onRunningChanged: if (!running) heroGlyph.opacity = 1
+                }
               }
 
               Column {
-                spacing: Style.space(2)
                 anchors.verticalCenter: parent.verticalCenter
+                spacing: 0
 
                 Text {
-                  text: root.fleetName
-                  color: Color.popups.text
+                  text: root.summary && root.summary.peersTotal > 0
+                    ? root.summary.peersOnline + "/" + root.summary.peersTotal : "—"
+                  color: root.panelFg
                   font.family: root.bar ? root.bar.fontFamily : Style.font.family
-                  font.pixelSize: Style.font.body
+                  font.pixelSize: 34
                   font.bold: true
                 }
 
                 Text {
-                  text: Model.summaryLine(root.summary)
-                  color: root.severity === "ok" ? Color.muted
-                    : root.severityColor(root.severity, Color.popups.text)
+                  text: "NODES ONLINE"
+                  color: root.dim
                   font.family: root.bar ? root.bar.fontFamily : Style.font.family
                   font.pixelSize: Style.font.caption
+                  font.letterSpacing: 1
+                }
+              }
+
+              Column {
+                visible: root.summary !== null && root.summary.issues > 0
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: 0
+
+                Text {
+                  text: root.summary ? "!" + root.summary.issues : ""
+                  color: root.severityColor(root.severity, root.panelFg)
+                  font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                  font.pixelSize: 34
+                  font.bold: true
+                }
+
+                Text {
+                  text: root.summary && root.summary.issues === 1 ? "ISSUE" : "ISSUES"
+                  color: root.dim
+                  font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                  font.pixelSize: Style.font.caption
+                  font.letterSpacing: 1
                 }
               }
             }
 
-            Text {
-              visible: root.dashboardUrl !== ""
-              text: ""
-              color: dashboardMouse.containsMouse ? Color.accent : Color.muted
-              font.family: root.bar ? root.bar.fontFamily : Style.font.family
-              font.pixelSize: Style.font.body
+            Column {
+              id: heroRight
               anchors.right: parent.right
+              anchors.rightMargin: Style.space(2)
               anchors.verticalCenter: parent.verticalCenter
+              spacing: Style.space(6)
 
-              MouseArea {
-                id: dashboardMouse
-                anchors.fill: parent
-                anchors.margins: -Style.space(6)
-                hoverEnabled: true
-                cursorShape: Qt.PointingHandCursor
-                onClicked: root.openDashboard()
+              Text {
+                text: root.fleetName.toUpperCase()
+                color: root.dim
+                font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                font.pixelSize: Style.font.caption
+                font.letterSpacing: 1
+                anchors.right: parent.right
+              }
+
+              Row {
+                anchors.right: parent.right
+                spacing: Style.space(2)
+
+                PanelActionButton {
+                  iconText: "󰑐"
+                  tooltipText: "Refresh"
+                  foreground: root.panelFg
+                  fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+                  onClicked: root.refresh()
+                }
+
+                PanelActionButton {
+                  visible: root.dashboardUrl !== ""
+                  iconText: "󰖟"
+                  tooltipText: "Open dashboard"
+                  foreground: root.panelFg
+                  fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+                  onClicked: root.openDashboard()
+                }
               }
             }
           }
@@ -353,7 +420,7 @@ Panel {
             visible: root.reportErrors.length > 0 || root.collectorError !== ""
             width: parent.width
             implicitHeight: errorColumn.implicitHeight + Style.space(12)
-            radius: Style.space(6)
+            radius: Style.cornerRadius
             color: root.tinted(Color.urgent, 0.12)
             border.color: root.tinted(Color.urgent, 0.5)
             border.width: 1
@@ -381,81 +448,121 @@ Panel {
             }
           }
 
-          // ---- Nodes ----
           PanelSectionHeader {
             visible: root.peers.length > 0
             text: "NODES"
           }
 
-          Flow {
-            visible: root.peers.length > 0
+          Column {
             width: parent.width
-            spacing: Style.space(6)
+            spacing: 0
 
             Repeater {
               model: root.peers
 
-              Rectangle {
+              CursorSurface {
+                id: nodeRow
                 required property var modelData
                 readonly property string state: Model.peerState(modelData)
                 readonly property color dotColor: state === "online" ? Color.accent
-                  : state === "offline-expected" ? Color.urgent : Color.muted
+                  : state === "offline-expected" ? Color.urgent : root.dim
 
-                radius: Style.space(6)
-                color: peerMouse.containsMouse
-                  ? root.tinted(Color.popups.text, 0.12)
-                  : root.tinted(Color.popups.text, 0.06)
-                implicitWidth: peerRow.implicitWidth + Style.space(16)
-                implicitHeight: peerRow.implicitHeight + Style.space(10)
-
-                Row {
-                  id: peerRow
-                  anchors.centerIn: parent
-                  spacing: Style.space(6)
-
-                  Rectangle {
-                    width: Style.space(7)
-                    height: width
-                    radius: width / 2
-                    color: dotColor
-                    anchors.verticalCenter: parent.verticalCenter
-                  }
-
-                  Text {
-                    text: Model.osIcon(modelData.os)
-                    color: Color.muted
-                    font.family: root.bar ? root.bar.fontFamily : Style.font.family
-                    font.pixelSize: Style.font.caption
-                    anchors.verticalCenter: parent.verticalCenter
-                  }
-
-                  Text {
-                    text: modelData.name + (modelData.self ? " (this)" : "")
-                    color: modelData.online ? Color.popups.text : Color.muted
-                    font.family: root.bar ? root.bar.fontFamily : Style.font.family
-                    font.pixelSize: Style.font.caption
-                    anchors.verticalCenter: parent.verticalCenter
-                  }
-                }
+                width: parent.width
+                implicitHeight: nodeInner.implicitHeight + Style.spacing.xl
+                radius: Style.cornerRadius
+                foreground: root.panelFg
+                hasCursor: nodeMouse.containsMouse
 
                 MouseArea {
-                  id: peerMouse
+                  id: nodeMouse
                   anchors.fill: parent
                   hoverEnabled: true
-                  cursorShape: modelData.ip ? Qt.PointingHandCursor : Qt.ArrowCursor
-                  onClicked: root.copyPeerIp(modelData)
+                  cursorShape: nodeRow.modelData.ip ? Qt.PointingHandCursor : Qt.ArrowCursor
+                  onClicked: root.copyPeerIp(nodeRow.modelData)
                 }
 
-                PanelToolTip {
-                  visible: peerMouse.containsMouse
-                  text: (modelData.ip ? modelData.ip + " — click to copy" : "no IPv4")
-                    + (modelData.online ? "" : " · offline")
+                RowLayout {
+                  id: nodeInner
+                  anchors.left: parent.left
+                  anchors.right: parent.right
+                  anchors.verticalCenter: parent.verticalCenter
+                  anchors.leftMargin: Style.space(8)
+                  anchors.rightMargin: Style.space(6)
+                  spacing: Style.space(10)
+
+                  Item {
+                    width: Style.space(8)
+                    height: width
+                    Layout.alignment: Qt.AlignVCenter
+
+                    Rectangle {
+                      id: nodeDot
+                      anchors.centerIn: parent
+                      width: Style.space(7)
+                      height: width
+                      radius: width / 2
+                      color: nodeRow.dotColor
+
+                      // Live nodes breathe softly while the panel is open —
+                      // the fleet reads as alive, not as a table.
+                      SequentialAnimation on opacity {
+                        running: nodeRow.modelData.online && root.opened
+                        loops: Animation.Infinite
+                        NumberAnimation { to: 0.4; duration: 1600; easing.type: Easing.InOutSine }
+                        NumberAnimation { to: 1.0; duration: 1600; easing.type: Easing.InOutSine }
+                        onRunningChanged: if (!running) nodeDot.opacity = 1
+                      }
+                    }
+                  }
+
+                  Text {
+                    text: Model.osIcon(nodeRow.modelData.os)
+                    color: root.dim
+                    font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                    font.pixelSize: Style.font.icon
+                    Layout.alignment: Qt.AlignVCenter
+                  }
+
+                  ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: Style.space(1)
+
+                    Text {
+                      Layout.fillWidth: true
+                      textFormat: Text.PlainText
+                      text: nodeRow.modelData.name
+                      color: nodeRow.modelData.online ? root.panelFg : root.dim
+                      font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                      font.pixelSize: Style.font.body
+                      elide: Text.ElideRight
+                    }
+
+                    Text {
+                      Layout.fillWidth: true
+                      textFormat: Text.PlainText
+                      text: Model.peerDetail(nodeRow.modelData)
+                      color: nodeRow.state === "offline-expected"
+                        ? root.mix(root.dim, Color.urgent, 0.6) : root.dim
+                      font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                      font.pixelSize: Style.font.caption
+                      elide: Text.ElideRight
+                    }
+                  }
+
+                  PanelActionButton {
+                    visible: nodeRow.modelData.ip !== ""
+                    iconText: "󰆏"
+                    tooltipText: "Copy " + nodeRow.modelData.ip
+                    foreground: root.panelFg
+                    fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+                    Layout.alignment: Qt.AlignVCenter
+                    onClicked: root.copyPeerIp(nodeRow.modelData)
+                  }
                 }
               }
             }
           }
 
-          // ---- Checks ----
           PanelSectionHeader {
             visible: root.checks.length > 0
             text: "CHECKS"
@@ -463,68 +570,83 @@ Panel {
 
           Column {
             width: parent.width
-            spacing: Style.space(8)
+            spacing: 0
 
             Repeater {
               model: root.checks
 
-              Column {
+              Item {
+                id: checkRow
                 required property var modelData
                 width: parent.width
-                spacing: Style.space(4)
+                implicitHeight: checkInner.implicitHeight + Style.spacing.xl
 
-                Item {
-                  width: parent.width
-                  height: checkName.implicitHeight
+                RowLayout {
+                  id: checkInner
+                  anchors.left: parent.left
+                  anchors.right: parent.right
+                  anchors.verticalCenter: parent.verticalCenter
+                  anchors.leftMargin: Style.space(8)
+                  anchors.rightMargin: Style.space(8)
+                  spacing: Style.space(10)
 
-                  Row {
-                    spacing: Style.space(6)
+                  Rectangle {
+                    id: checkDot
+                    width: Style.space(7)
+                    height: width
+                    radius: width / 2
+                    color: root.severityColor(checkRow.modelData.severity, Color.accent)
+                    Layout.alignment: Qt.AlignVCenter
 
-                    Rectangle {
-                      width: Style.space(7)
-                      height: width
-                      radius: width / 2
-                      color: root.severityColor(modelData.severity, Color.accent)
-                      anchors.verticalCenter: parent.verticalCenter
-                    }
-
-                    Text {
-                      id: checkName
-                      text: modelData.name
-                      color: Color.popups.text
-                      font.family: root.bar ? root.bar.fontFamily : Style.font.family
-                      font.pixelSize: Style.font.caption
-                      font.bold: true
+                    SequentialAnimation on opacity {
+                      running: checkRow.modelData.severity === "crit" && root.opened
+                      loops: Animation.Infinite
+                      NumberAnimation { to: 0.4; duration: 700; easing.type: Easing.InOutSine }
+                      NumberAnimation { to: 1.0; duration: 700; easing.type: Easing.InOutSine }
+                      onRunningChanged: if (!running) checkDot.opacity = 1
                     }
                   }
 
-                  Text {
-                    id: checkStatus
-                    text: modelData.error ? modelData.error
-                      : (modelData.severity === "ok" ? "ok" : modelData.severity)
-                    color: root.severityColor(modelData.severity, Color.muted)
-                    font.family: root.bar ? root.bar.fontFamily : Style.font.family
-                    font.pixelSize: Style.font.caption
-                    anchors.right: parent.right
-                    anchors.verticalCenter: parent.verticalCenter
+                  ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: Style.space(1)
+
+                    Text {
+                      Layout.fillWidth: true
+                      textFormat: Text.PlainText
+                      text: checkRow.modelData.name
+                      color: root.panelFg
+                      font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                      font.pixelSize: Style.font.body
+                      elide: Text.ElideRight
+                    }
+
+                    Text {
+                      Layout.fillWidth: true
+                      textFormat: Text.PlainText
+                      visible: text !== ""
+                      text: Model.checkDetail(checkRow.modelData)
+                      color: checkRow.modelData.severity === "ok" ? root.dim
+                        : root.severityColor(checkRow.modelData.severity, root.dim)
+                      font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                      font.pixelSize: Style.font.caption
+                      elide: Text.ElideRight
+                    }
                   }
 
                   // Worst-direction trend over the configured history span.
                   Canvas {
                     id: spark
-                    visible: (modelData.history || []).length >= 2
+                    visible: (checkRow.modelData.history || []).length >= 2
                     width: Style.space(56)
-                    height: Style.space(12)
-                    anchors.right: checkStatus.left
-                    anchors.rightMargin: Style.space(10)
-                    anchors.verticalCenter: parent.verticalCenter
-
+                    height: Style.space(14)
+                    Layout.alignment: Qt.AlignVCenter
                     antialiasing: true
 
-                    readonly property var trace: modelData.history || []
+                    readonly property var trace: checkRow.modelData.history || []
                     readonly property color lineColor: root.tinted(
-                      root.severityColor(modelData.severity, Color.popups.text),
-                      modelData.severity === "ok" ? 0.55 : 0.9)
+                      root.severityColor(checkRow.modelData.severity, root.panelFg),
+                      checkRow.modelData.severity === "ok" ? 0.55 : 0.9)
 
                     // A Canvas that is created hidden (or before its backing
                     // store exists) drops requestPaint silently — every
@@ -569,35 +691,15 @@ Panel {
                       ctx.stroke()
                     }
                   }
-                }
 
-                Flow {
-                  width: parent.width
-                  spacing: Style.space(4)
-                  visible: modelData.series.length > 0
-
-                  Repeater {
-                    model: modelData.series
-
-                    Rectangle {
-                      required property var modelData
-                      radius: Style.space(4)
-                      color: modelData.severity === "ok"
-                        ? root.tinted(Color.popups.text, 0.05)
-                        : root.tinted(root.severityColor(modelData.severity, Color.popups.text), 0.15)
-                      implicitWidth: seriesText.implicitWidth + Style.space(12)
-                      implicitHeight: seriesText.implicitHeight + Style.space(6)
-
-                      Text {
-                        id: seriesText
-                        anchors.centerIn: parent
-                        text: modelData.label + " " + modelData.display
-                        color: modelData.severity === "ok" ? Color.muted
-                          : root.severityColor(modelData.severity, Color.popups.text)
-                        font.family: root.bar ? root.bar.fontFamily : Style.font.family
-                        font.pixelSize: Style.font.caption
-                      }
-                    }
+                  Text {
+                    textFormat: Text.PlainText
+                    text: Model.checkHeadline(checkRow.modelData)
+                    color: checkRow.modelData.severity === "ok" ? root.dim
+                      : root.severityColor(checkRow.modelData.severity, root.panelFg)
+                    font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                    font.pixelSize: Style.font.caption
+                    Layout.alignment: Qt.AlignVCenter
                   }
                 }
               }
@@ -619,7 +721,7 @@ Panel {
                 bits.push("metrics " + root.report.vm.latencyMs + "ms")
               return bits.join(" · ")
             }
-            color: root.stale ? Color.urgent : Color.muted
+            color: root.stale ? Color.urgent : root.dim
             font.family: root.bar ? root.bar.fontFamily : Style.font.family
             font.pixelSize: Style.font.caption
           }

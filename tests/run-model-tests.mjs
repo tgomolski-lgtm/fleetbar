@@ -11,7 +11,7 @@ const source = readFileSync(join(here, "..", "Model.js"), "utf8")
   .replace(/^\.pragma library$/m, "");
 const Model = new Function(`${source};
   return { severityRank, worstSeverity, barLabel, summaryLine, reportErrors,
-           relTime, osIcon, peerState, isStale, issueSummary };`)();
+           relTime, osIcon, peerState, isStale, issueSummary, checkHeadline, checkDetail, peerDetail };`)();
 
 let passed = 0;
 function test(name, fn) {
@@ -113,6 +113,35 @@ test("issueSummary names offenders, skips healthy, caps length", () => {
   assert.equal(capped.length, 20);
   assert.ok(capped.endsWith("…"));
   assert.equal(Model.issueSummary(null, 180), "");
+});
+
+
+test("checkHeadline: healthy updown collapses, failures lead", () => {
+  const up = (l) => ({ label: l, display: "up", severity: "ok" });
+  assert.equal(Model.checkHeadline({ format: "updown", severity: "ok", error: null,
+    series: [up("a"), up("b"), up("c")] }), "3 up");
+  assert.equal(Model.checkHeadline({ format: "updown", severity: "crit", error: null,
+    series: [{ label: "s2", display: "DOWN", severity: "crit" },
+             { label: "s3", display: "DOWN", severity: "crit" }, up("a")] }), "s2 DOWN +1");
+  assert.equal(Model.checkHeadline({ format: "percent", severity: "warn", error: null,
+    series: [{ label: "omarchy", display: "86%", severity: "warn" },
+             { label: "droplet", display: "26%", severity: "ok" }] }), "omarchy 86%");
+  assert.equal(Model.checkHeadline({ format: "percent", severity: "ok", error: null,
+    series: [{ label: "a", display: "26%", severity: "ok" }] }), "26%");
+  assert.equal(Model.checkHeadline({ severity: "unknown", error: "no data", series: [] }), "?");
+  assert.equal(Model.checkHeadline(null), "—");
+});
+
+test("checkDetail and peerDetail read naturally", () => {
+  assert.equal(Model.checkDetail({ error: null, series: [
+    { label: "droplet", display: "26.2%" }, { label: "omarchy", display: "45.3%" }] }),
+    "droplet 26.2% · omarchy 45.3%");
+  assert.equal(Model.checkDetail({ error: "unreachable", series: [] }), "unreachable");
+  assert.equal(Model.peerDetail({ ip: "100.1.2.3", self: true, online: true }),
+    "100.1.2.3 · this machine");
+  assert.equal(Model.peerDetail({ ip: "100.1.2.4", self: false, online: false, expected: true }),
+    "100.1.2.4 · offline — expected online");
+  assert.equal(Model.peerDetail({ ip: "", self: false, online: true }), "online");
 });
 
 console.log(`\n${passed} tests passed`);

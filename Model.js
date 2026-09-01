@@ -87,6 +87,51 @@ function issueSummary(report, maxLen) {
   return text.length > cap ? text.substring(0, cap - 1) + "…" : text;
 }
 
+// Right-hand headline for a check row: the one value worth reading first.
+// Healthy updown checks collapse to "N up"; anything failing leads with the
+// worst offender (series arrive sorted worst-first from the collector).
+function checkHeadline(check) {
+  if (!check) return "—";
+  if (check.error) return check.severity === "unknown" ? "?" : check.severity;
+  var s = check.series || [];
+  if (s.length === 0) return "—";
+  var bad = [];
+  for (var i = 0; i < s.length; i++)
+    if (s[i].severity !== "ok") bad.push(s[i]);
+  if (check.format === "updown") {
+    if (bad.length === 0) return s.length + " up";
+    var text = bad[0].label + " DOWN";
+    return bad.length > 1 ? text + " +" + (bad.length - 1) : text;
+  }
+  var lead = bad.length > 0 ? bad[0] : s[0];
+  return s.length > 1 ? lead.label + " " + lead.display : lead.display;
+}
+
+// Caption line under a check name: every series value, or the error. A
+// fully healthy updown check returns nothing — its headline ("5 up")
+// already says everything, and a list of "x up · y up" is pure noise.
+function checkDetail(check) {
+  if (!check) return "";
+  if (check.error) return check.error;
+  if (check.format === "updown" && check.severity === "ok") return "";
+  var s = check.series || [];
+  var parts = [];
+  for (var i = 0; i < s.length; i++)
+    parts.push(s[i].label + " " + s[i].display);
+  return parts.join(" · ");
+}
+
+// Caption line under a node name: address plus a plain-words state.
+function peerDetail(peer) {
+  if (!peer) return "";
+  var parts = [];
+  if (peer.ip) parts.push(peer.ip);
+  if (peer.self) parts.push("this machine");
+  else if (peer.online) parts.push("online");
+  else parts.push(peer.expected ? "offline — expected online" : "offline");
+  return parts.join(" · ");
+}
+
 function relTime(epochSeconds, nowMs) {
   if (!epochSeconds) return "never";
   var s = Math.max(0, Math.round(nowMs / 1000 - epochSeconds));
