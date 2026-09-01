@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "stratoforce.fleetbar",
   "name": "Fleetbar",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "author": "StratoForce AI",
   "license": "MIT",
   "description": "Your fleet's heartbeat in the bar: Tailscale node status plus any Prometheus/VictoriaMetrics checks with thresholds — failures surface explicitly, never as silent green.",
