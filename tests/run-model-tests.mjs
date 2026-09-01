@@ -11,7 +11,7 @@ const source = readFileSync(join(here, "..", "Model.js"), "utf8")
   .replace(/^\.pragma library$/m, "");
 const Model = new Function(`${source};
   return { severityRank, worstSeverity, barLabel, summaryLine, reportErrors,
-           relTime, osIcon, peerState, isStale, issueSummary, checkHeadline, checkDetail, peerDetail };`)();
+           relTime, osIcon, peerState, isStale, issueSummary, checkHeadline, checkDetail, peerDetail, peerBadge };`)();
 
 let passed = 0;
 function test(name, fn) {
@@ -142,6 +142,23 @@ test("checkDetail and peerDetail read naturally", () => {
   assert.equal(Model.peerDetail({ ip: "100.1.2.4", self: false, online: false, expected: true }),
     "100.1.2.4 · offline — expected online");
   assert.equal(Model.peerDetail({ ip: "", self: false, online: true }), "online");
+});
+
+test("peerDetail: identity wins online, last-seen joins offline", () => {
+  assert.equal(Model.peerDetail({ ip: "100.1.2.5", online: true, self: false,
+    identity: "M4 Pro · 12c · 24G" }), "100.1.2.5 · M4 Pro · 12c · 24G");
+  assert.equal(Model.peerDetail({ ip: "100.1.2.6", online: false, self: false,
+    expected: false, offlineFor: "18d" }), "100.1.2.6 · offline · last seen 18d ago");
+});
+
+test("peerBadge: latency chip only for measured remote peers", () => {
+  assert.equal(Model.peerBadge({ online: true, self: false, latencyMs: 1, path: "direct" }),
+    "1ms");
+  assert.equal(Model.peerBadge({ online: true, self: false, latencyMs: 23, path: "via mia" }),
+    "23ms · via mia");
+  assert.equal(Model.peerBadge({ online: true, self: false, latencyMs: null, path: null }), "");
+  assert.equal(Model.peerBadge({ online: true, self: true, latencyMs: 1 }), "");
+  assert.equal(Model.peerBadge({ online: false, self: false, latencyMs: 1 }), "");
 });
 
 console.log(`\n${passed} tests passed`);

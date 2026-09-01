@@ -121,15 +121,33 @@ function checkDetail(check) {
   return parts.join(" · ");
 }
 
-// Caption line under a node name: address plus a plain-words state.
+// Caption line under a node name: address, then the most informative thing
+// known — machine identity for live nodes, honest absence for offline ones.
 function peerDetail(peer) {
   if (!peer) return "";
   var parts = [];
   if (peer.ip) parts.push(peer.ip);
-  if (peer.self) parts.push("this machine");
-  else if (peer.online) parts.push("online");
-  else parts.push(peer.expected ? "offline — expected online" : "offline");
+  if (!peer.online) {
+    parts.push(peer.expected ? "offline — expected online" : "offline");
+    if (peer.offlineFor) parts.push("last seen " + peer.offlineFor + " ago");
+  } else if (peer.identity) {
+    parts.push(peer.identity);
+  } else {
+    parts.push(peer.self ? "this machine" : "online");
+  }
   return parts.join(" · ");
+}
+
+// Right-aligned latency chip for a node row. Direct P2P is the healthy
+// normal, so it stays implicit — the path is only spelled out when traffic
+// is bouncing through a relay ("23ms · via mia"), which is the anomaly
+// worth noticing. Unmeasured stays blank; a failed probe never fakes a
+// number.
+function peerBadge(peer) {
+  if (!peer || !peer.online || peer.self) return "";
+  if (peer.latencyMs === null || peer.latencyMs === undefined) return "";
+  var path = peer.path && peer.path !== "direct" ? " · " + peer.path : "";
+  return peer.latencyMs + "ms" + path;
 }
 
 function relTime(epochSeconds, nowMs) {

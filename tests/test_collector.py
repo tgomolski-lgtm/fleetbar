@@ -249,6 +249,61 @@ class HistoryTests(unittest.TestCase):
                                                 None)["history"], [])
 
 
+class LatencyAndIdentityTests(unittest.TestCase):
+    def test_parse_pong_direct_and_relay(self):
+        self.assertEqual(collector.parse_pong(
+            "pong from mini (100.1.2.3) via [2600::1]:41641 in 1ms"),
+            (1, "direct"))
+        self.assertEqual(collector.parse_pong(
+            "pong from nas (100.1.2.4) via DERP(mia) in 23ms"),
+            (23, "via mia"))
+        self.assertEqual(collector.parse_pong("no reply"), (None, None))
+        self.assertEqual(collector.parse_pong(""), (None, None))
+
+    def test_humanize_since(self):
+        import datetime as dt
+        now = dt.datetime.now(dt.timezone.utc)
+        iso = lambda delta: (now - delta).isoformat().replace("+00:00", "Z")
+        self.assertIsNone(collector.humanize_since("0001-01-01T00:00:00Z"))
+        self.assertIsNone(collector.humanize_since(""))
+        self.assertIsNone(collector.humanize_since("garbage"))
+        self.assertEqual(collector.humanize_since(
+            iso(dt.timedelta(minutes=30))), "30m")
+        self.assertEqual(collector.humanize_since(
+            iso(dt.timedelta(hours=5))), "5h")
+        self.assertEqual(collector.humanize_since(
+            iso(dt.timedelta(days=18))), "18d")
+
+    def test_identity_line(self):
+        self.assertEqual(collector.identity_line(
+            {"chip": "Apple M4 Pro", "cores": 12, "memGb": 24}),
+            "M4 Pro · 12c · 24G")
+        self.assertEqual(collector.identity_line(
+            {"chip": "AMD FX-8350"}), "FX-8350")
+        self.assertEqual(collector.identity_line(
+            {"chip": "Snapdragon X"}), "Snapdragon X")
+        self.assertEqual(collector.identity_line({"cores": 8}), "8c")
+        self.assertEqual(collector.identity_line({}), "")
+
+    def test_attach_exact_match_only(self):
+        peers = [
+            {"name": "mac-studio", "host": "Mac Studio", "identity": None},
+            {"name": "thomass-mac-studio", "host": "x", "identity": None},
+            {"name": "omarchy", "host": "omarchy", "identity": None},
+        ]
+        info = {
+            "Watchdog": {"chip": "M3 Ultra", "cores": 28, "memGb": 96},
+            "Omarchy": {"chip": "FX-8350", "cores": 8, "memGb": 16},
+            "Unmapped": {"chip": "Ghost"},
+        }
+        collector.attach_node_info(peers, info, {"Watchdog": "mac-studio"})
+        # Alias lands on the exact name; never leaks onto the longer one.
+        self.assertEqual(peers[0]["identity"], "M3 Ultra · 28c · 96G")
+        self.assertIsNone(peers[1]["identity"])
+        # No alias: exact case-insensitive label==name fallback.
+        self.assertEqual(peers[2]["identity"], "FX-8350 · 8c · 16G")
+
+
 class VmErrorTests(unittest.TestCase):
     def test_unreachable_vm_marks_all_checks_unknown(self):
         vm, checks = collector.collect_checks(

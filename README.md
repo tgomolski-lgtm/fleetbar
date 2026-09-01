@@ -83,6 +83,27 @@ Edits to the config apply live — the panel watches the file.
 | `unit`, `decimals` | Display suffix and precision for `number`. |
 | `history` | `false` to skip the sparkline range query for this check. |
 
+### Node identity (optional)
+
+Latency probes run by default (`tailscale ping`, parallel, one per online
+peer; disable with `"tailscale": {"latency": false}`). To label each row
+with its machine (`M3 Ultra · 32c · 256G`), point `nodeInfo` at inventory
+metrics; `aliases` maps the metric's label to the node's exact tailnet
+short name (exact match only — substrings would misassign lookalikes):
+
+```jsonc
+"nodeInfo": {
+  "infoQuery": "fleet_inventory_info",        // reads a `chip` label
+  "coresQuery": "fleet_inventory_cpu_cores",
+  "memBytesQuery": "fleet_inventory_memory_bytes",
+  "labelKey": "asset",
+  "aliases": { "Atlas": "my-studio", "Busta": "my-mini" }
+}
+```
+
+Identity and latency are decoration: a failed probe or query leaves the
+field blank, never fakes a value, and never fails the node.
+
 Global history tuning (optional, top-level): `"history": {"enabled": true,
 "spanSec": 10800, "points": 40}` — the sparkline is a range query over
 `spanSec`, folded across series in the check's worst direction (`min` per

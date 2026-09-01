@@ -273,7 +273,7 @@ Panel {
     open: root.opened
     centerOnBar: true
     focusTarget: keyCatcher
-    contentWidth: panel.fittedContentWidth(Style.space(420))
+    contentWidth: panel.fittedContentWidth(Style.space(440))
     contentHeight: panel.fittedContentHeight(fleetColumn.implicitHeight + Style.space(32))
 
     PanelKeyCatcher {
@@ -530,7 +530,7 @@ Panel {
                     Text {
                       Layout.fillWidth: true
                       textFormat: Text.PlainText
-                      text: nodeRow.modelData.name
+                      text: nodeRow.modelData.name + (nodeRow.modelData.self ? "  (this)" : "")
                       color: nodeRow.modelData.online ? root.panelFg : root.dim
                       font.family: root.bar ? root.bar.fontFamily : Style.font.family
                       font.pixelSize: Style.font.body
@@ -547,6 +547,16 @@ Panel {
                       font.pixelSize: Style.font.caption
                       elide: Text.ElideRight
                     }
+                  }
+
+                  Text {
+                    visible: text !== ""
+                    textFormat: Text.PlainText
+                    text: Model.peerBadge(nodeRow.modelData)
+                    color: root.dim
+                    font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                    font.pixelSize: Style.font.caption
+                    Layout.alignment: Qt.AlignVCenter
                   }
 
                   PanelActionButton {

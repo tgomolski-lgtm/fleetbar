@@ -21,6 +21,7 @@ Design contract with the QML side:
 
 import argparse
 import concurrent.futures
+import datetime
 import json
 import os
 import re
@@ -57,6 +58,7 @@ CONFIG_DEFAULTS = {
     "victoriametrics": {},
     "checks": [],
     "history": {},
+    "nodeInfo": {},
 }
 
 
@@ -125,13 +127,18 @@ def collect_tailscale(ts_cfg):
         dns = str(node.get("DNSName") or "")
         name = dns.split(".")[0] if dns else str(node.get("HostName") or "?")
         ips = [ip for ip in (node.get("TailscaleIPs") or []) if "." in ip]
+        online = bool(node.get("Online")) or is_self
         return {
             "name": name,
             "host": str(node.get("HostName") or name),
             "ip": ips[0] if ips else "",
             "os": str(node.get("OS") or ""),
-            "online": bool(node.get("Online")) or is_self,
+            "online": online,
             "lastSeen": str(node.get("LastSeen") or ""),
+            "offlineFor": None if online else humanize_since(node.get("LastSeen")),
+            "latencyMs": None,
+            "path": None,
+            "identity": None,
             "self": is_self,
             "expected": False,
         }
@@ -157,6 +164,9 @@ def collect_tailscale(ts_cfg):
     # Self first, then online before offline, each group alphabetical.
     nodes.sort(key=lambda n: (not n["self"], not n["online"], n["name"].lower()))
 
+    if ts_cfg.get("latency", True):
+        probe_latency(nodes, _num(ts_cfg.get("latencyTimeoutSec"), 2))
+
     out["ok"] = True
     out["self"] = next((n for n in nodes if n["self"]), None)
     out["peers"] = nodes
@@ -167,6 +177,61 @@ def collect_tailscale(ts_cfg):
     if out["offlineExpected"]:
         out["severity"] = offline_sev
     return out
+
+
+# "pong from mini (100.x.y.z) via [addr]:41641 in 1ms" — a bracketed or
+# dotted endpoint means a direct P2P path; "via DERP(mia)" means relayed.
+PONG_RE = re.compile(r"\bvia (DERP\(([^)]+)\)|\S+) in (\d+)\s*ms")
+
+
+def parse_pong(text):
+    """Returns (latency_ms, path) or (None, None)."""
+    match = PONG_RE.search(text or "")
+    if not match:
+        return None, None
+    relay = match.group(2)
+    return int(match.group(3)), ("via " + relay) if relay else "direct"
+
+
+def probe_latency(nodes, timeout):
+    """One tailscale ping per online peer, in parallel. Latency is
+    decoration: a failed or timed-out probe leaves the fields None rather
+    than inventing a number or failing the source."""
+    targets = [n for n in nodes if n["online"] and not n["self"] and n["ip"]]
+
+    def ping(node):
+        try:
+            proc = subprocess.run(
+                ["tailscale", "ping", "-c", "1",
+                 "--timeout", "%gs" % timeout, node["ip"]],
+                capture_output=True, text=True, timeout=timeout + 2)
+        except (OSError, subprocess.TimeoutExpired):
+            return
+        node["latencyMs"], node["path"] = parse_pong(proc.stdout)
+
+    if not targets:
+        return
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(ping, targets))
+
+
+def humanize_since(iso_ts):
+    """'2026-08-13T20:05:58.1Z' -> '18d'. None for absent/epoch-zero stamps."""
+    raw = str(iso_ts or "")
+    if not raw or raw.startswith("0001-"):
+        return None
+    try:
+        then = datetime.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    seconds = (datetime.datetime.now(datetime.timezone.utc) - then).total_seconds()
+    if seconds < 0:
+        return None
+    if seconds < 3600:
+        return "%dm" % max(1, seconds // 60)
+    if seconds < 172800:
+        return "%dh" % (seconds // 3600)
+    return "%dd" % (seconds // 86400)
 
 
 def _safe_re(pattern):
@@ -420,6 +485,85 @@ def _check_shell(check, severity, error, series=None, history=None):
 
 
 # ---------------------------------------------------------------------------
+# Node identity join: machine specs from inventory metrics onto tailnet peers
+
+def collect_node_info(vm_cfg, ni_cfg):
+    """Returns {inventory_label: {"chip", "cores", "memGb"}} from up to three
+    instant queries. Purely decorative — any failure returns what it has."""
+    url = str((vm_cfg or {}).get("url") or "")
+    if not ni_cfg or not url:
+        return {}
+    timeout = _num((vm_cfg or {}).get("timeoutSec"), 5)
+    label_key = str(ni_cfg.get("labelKey") or "asset")
+    info = {}
+
+    def rows(query):
+        if not query:
+            return []
+        result, _, error = query_instant(url, query, timeout)
+        return result or [] if error is None else []
+
+    for item in rows(ni_cfg.get("infoQuery")):
+        metric = item.get("metric") or {}
+        label = metric.get(label_key)
+        if label:
+            entry = info.setdefault(str(label), {})
+            if metric.get("chip"):
+                entry["chip"] = str(metric["chip"])
+    for item in rows(ni_cfg.get("coresQuery")):
+        metric = item.get("metric") or {}
+        label = metric.get(label_key)
+        if label:
+            try:
+                info.setdefault(str(label), {})["cores"] = int(
+                    float(item["value"][1]))
+            except (KeyError, IndexError, TypeError, ValueError):
+                pass
+    for item in rows(ni_cfg.get("memBytesQuery")):
+        metric = item.get("metric") or {}
+        label = metric.get(label_key)
+        if label:
+            try:
+                gib = float(item["value"][1]) / (1024 ** 3)
+                info.setdefault(str(label), {})["memGb"] = round(gib) \
+                    if gib >= 10 else round(gib, 1)
+            except (KeyError, IndexError, TypeError, ValueError):
+                pass
+    return info
+
+
+VENDOR_PREFIX_RE = re.compile(r"^(Apple|AMD|Intel(\(R\))?|Genuine\w*)\s+",
+                              re.IGNORECASE)
+
+
+def identity_line(entry):
+    parts = []
+    if entry.get("chip"):
+        # "M3 Ultra" reads as well as "Apple M3 Ultra" and stops the caption
+        # from eliding away the cores/RAM that follow it.
+        parts.append(VENDOR_PREFIX_RE.sub("", entry["chip"]))
+    if entry.get("cores"):
+        parts.append("%dc" % entry["cores"])
+    if entry.get("memGb"):
+        parts.append("%gG" % entry["memGb"])
+    return " · ".join(parts)
+
+
+def attach_node_info(peers, info, aliases):
+    """Aliases map inventory label -> exact tailnet short name. Labels with
+    no alias fall back to an exact case-insensitive name match. Exact only:
+    substring matching would let 'mac-studio' claim every studio."""
+    by_name = {p["name"].lower(): p for p in peers}
+    for label, entry in info.items():
+        target = str(aliases.get(label, label)).lower()
+        peer = by_name.get(target)
+        if peer is not None:
+            line = identity_line(entry)
+            if line:
+                peer["identity"] = line
+
+
+# ---------------------------------------------------------------------------
 # Report
 
 def build_report(config_path):
@@ -429,6 +573,12 @@ def build_report(config_path):
     vm, checks = collect_checks(cfg.get("victoriametrics") or {},
                                 cfg.get("checks") or [],
                                 cfg.get("history") or {})
+
+    ni_cfg = cfg.get("nodeInfo") or {}
+    if ni_cfg and tailscale["peers"]:
+        attach_node_info(tailscale["peers"],
+                         collect_node_info(cfg.get("victoriametrics"), ni_cfg),
+                         ni_cfg.get("aliases") or {})
 
     severities = [tailscale["severity"]]
     severities += [c["severity"] for c in checks]
