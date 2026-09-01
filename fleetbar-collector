@@ -33,6 +33,27 @@ import urllib.parse
 import urllib.request
 
 SEVERITY_RANK = {"ok": 0, "unknown": 1, "warn": 2, "crit": 3}
+
+# Hard budgets. Config and network responses are producer-controlled data;
+# everything that crosses into the report is length-capped and count-capped
+# so no source can balloon the JSON the QML side must hold.
+MAX_STR = 200
+MAX_PEERS = 256
+MAX_CHECKS = 32
+MAX_SERIES = 64
+MAX_HISTORY_POINTS = 120
+MAX_STAT_ROWS = 256
+MAX_ALIASES = 256
+def _valid_ipv4(value):
+    parts = str(value).split(".")
+    return len(parts) == 4 and all(
+        p.isdigit() and len(p) <= 3 and int(p) <= 255 for p in parts)
+
+
+def _s(value, cap=MAX_STR):
+    """Producer-controlled string: coerced and truncated, never trusted for
+    length."""
+    return str(value or "")[:cap]
 VALID_OPS = {">": lambda v, t: v > t, ">=": lambda v, t: v >= t,
              "<": lambda v, t: v < t, "<=": lambda v, t: v <= t,
              "==": lambda v, t: v == t, "!=": lambda v, t: v != t}
@@ -126,17 +147,18 @@ def collect_tailscale(ts_cfg):
         offline_sev = "warn"
 
     def normalize(node, is_self):
-        dns = str(node.get("DNSName") or "")
-        name = dns.split(".")[0] if dns else str(node.get("HostName") or "?")
-        ips = [ip for ip in (node.get("TailscaleIPs") or []) if "." in ip]
+        dns = _s(node.get("DNSName"))
+        name = dns.split(".")[0] if dns else _s(node.get("HostName")) or "?"
+        ips = [ip for ip in (node.get("TailscaleIPs") or [])[:16]
+               if _valid_ipv4(ip)]
         online = bool(node.get("Online")) or is_self
         return {
-            "name": name,
-            "host": str(node.get("HostName") or name),
+            "name": _s(name, 64),
+            "host": _s(node.get("HostName") or name, 64),
             "ip": ips[0] if ips else "",
-            "os": str(node.get("OS") or ""),
+            "os": _s(node.get("OS"), 32),
             "online": online,
-            "lastSeen": str(node.get("LastSeen") or ""),
+            "lastSeen": _s(node.get("LastSeen"), 40),
             "offlineFor": None if online else humanize_since(node.get("LastSeen")),
             "latencyMs": None,
             "path": None,
@@ -149,8 +171,9 @@ def collect_tailscale(ts_cfg):
     nodes = []
     if isinstance(status.get("Self"), dict):
         nodes.append(normalize(status["Self"], True))
-    for peer in (status.get("Peer") or {}).values():
-        nodes.append(normalize(peer, False))
+    for peer in list((status.get("Peer") or {}).values())[:MAX_PEERS]:
+        if isinstance(peer, dict):
+            nodes.append(normalize(peer, False))
 
     def hidden(n):
         if n["os"].lower() in hide_os:
@@ -256,14 +279,32 @@ def _num(value, fallback):
 # ---------------------------------------------------------------------------
 # Prometheus-compatible source
 
+# Same-origin fetches only: redirects are refused instead of followed, so a
+# compromised or misconfigured metrics endpoint cannot bounce requests to a
+# different host.
+class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_OPENER = urllib.request.build_opener(_RefuseRedirect)
+
+
+def _url_allowed(url):
+    scheme = urllib.parse.urlsplit(url).scheme.lower()
+    return scheme in ("http", "https")
+
+
 def query_instant(base_url, query, timeout):
     """Returns (result_list, latency_ms, error). result_list is the raw
     vector `result` array from the API."""
     url = base_url.rstrip("/") + "/api/v1/query?" + urllib.parse.urlencode(
         {"query": query})
     started = time.monotonic()
+    if not _url_allowed(url):
+        return None, 0, "metrics url must be http(s)"
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
+        with _OPENER.open(url, timeout=timeout) as resp:
             body = resp.read(4 * 1024 * 1024)
     except urllib.error.HTTPError as exc:
         return None, _ms(started), "HTTP %s from %s" % (exc.code, exc.reason)
@@ -294,8 +335,10 @@ def query_range(base_url, query, span_sec, points, timeout):
     url = base_url.rstrip("/") + "/api/v1/query_range?" + urllib.parse.urlencode(
         {"query": query, "start": now - int(span_sec), "end": now,
          "step": step})
+    if not _url_allowed(url):
+        return None, "metrics url must be http(s)"
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
+        with _OPENER.open(url, timeout=timeout) as resp:
             body = resp.read(8 * 1024 * 1024)
         doc = json.loads(body)
     except Exception as exc:  # history is decoration; any failure degrades soft
@@ -338,12 +381,13 @@ LABEL_PREFERENCE = ("node", "host", "instance", "job")
 
 def series_label(metric, label_key):
     if label_key and metric.get(label_key):
-        return str(metric[label_key])
+        return _s(metric[label_key], 64)
     for key in LABEL_PREFERENCE:
         if metric.get(key):
-            return str(metric[key])
+            return _s(metric[key], 64)
     named = {k: v for k, v in metric.items() if k != "__name__"}
-    return ",".join("%s=%s" % kv for kv in sorted(named.items())) or "value"
+    return _s(",".join("%s=%s" % kv for kv in sorted(named.items())), 64) \
+        or "value"
 
 
 def evaluate_check(check, result):
@@ -353,12 +397,12 @@ def evaluate_check(check, result):
     warn = check.get("warn")
     crit = check.get("crit")
     fmt = str(check.get("format", "number"))
-    unit = str(check.get("unit", ""))
-    decimals = int(_num(check.get("decimals"), 1))
+    unit = _s(check.get("unit"), 16)
+    decimals = min(6, max(0, int(_num(check.get("decimals"), 1))))
     label_key = check.get("labelKey")
 
     series = []
-    for item in result:
+    for item in result[:MAX_SERIES]:
         try:
             value = float(item["value"][1])
         except (KeyError, IndexError, TypeError, ValueError):
@@ -428,11 +472,13 @@ def collect_checks(vm_cfg, checks_cfg, hist_cfg=None):
                                        "no metrics source configured"))
         return vm, checks
 
-    timeout = _num(vm_cfg.get("timeoutSec"), 5)
+    timeout = min(30, _num(vm_cfg.get("timeoutSec"), 5))
+    checks_cfg = [c for c in checks_cfg if isinstance(c, dict)][:MAX_CHECKS]
     hist_cfg = hist_cfg or {}
     hist_enabled = hist_cfg.get("enabled", True)
-    hist_span = int(_num(hist_cfg.get("spanSec"), 10800))
-    hist_points = int(_num(hist_cfg.get("points"), 40))
+    hist_span = min(7 * 86400, int(_num(hist_cfg.get("spanSec"), 10800)))
+    hist_points = min(MAX_HISTORY_POINTS,
+                      max(2, int(_num(hist_cfg.get("points"), 40))))
 
     def run_one(check):
         query = str(check.get("query") or "")
@@ -473,10 +519,10 @@ def collect_checks(vm_cfg, checks_cfg, hist_cfg=None):
 
 def _check_shell(check, severity, error, series=None, history=None):
     return {
-        "id": str(check.get("id") or check.get("name") or "check"),
-        "name": str(check.get("name") or check.get("id") or "Check"),
+        "id": _s(check.get("id") or check.get("name") or "check", 64),
+        "name": _s(check.get("name") or check.get("id") or "Check", 64),
         "severity": severity,
-        "error": error,
+        "error": _s(error) if error else error,
         "series": series or [],
         "history": history or [],
         "op": str(check.get("op", ">=")),
@@ -496,7 +542,7 @@ def collect_node_info(vm_cfg, ni_cfg):
     url = str((vm_cfg or {}).get("url") or "")
     if not ni_cfg or not url:
         return {}
-    timeout = _num((vm_cfg or {}).get("timeoutSec"), 5)
+    timeout = min(30, _num((vm_cfg or {}).get("timeoutSec"), 5))
     label_key = str(ni_cfg.get("labelKey") or "asset")
     info = {}
 
@@ -504,21 +550,21 @@ def collect_node_info(vm_cfg, ni_cfg):
         if not query:
             return []
         result, _, error = query_instant(url, query, timeout)
-        return result or [] if error is None else []
+        return (result or [])[:MAX_STAT_ROWS] if error is None else []
 
     for item in rows(ni_cfg.get("infoQuery")):
         metric = item.get("metric") or {}
         label = metric.get(label_key)
         if label:
-            entry = info.setdefault(str(label), {})
+            entry = info.setdefault(_s(label, 64), {})
             if metric.get("chip"):
-                entry["chip"] = str(metric["chip"])
+                entry["chip"] = _s(metric["chip"], 48)
     for item in rows(ni_cfg.get("coresQuery")):
         metric = item.get("metric") or {}
         label = metric.get(label_key)
         if label:
             try:
-                info.setdefault(str(label), {})["cores"] = int(
+                info.setdefault(_s(label, 64), {})["cores"] = int(
                     float(item["value"][1]))
             except (KeyError, IndexError, TypeError, ValueError):
                 pass
@@ -528,7 +574,7 @@ def collect_node_info(vm_cfg, ni_cfg):
         if label:
             try:
                 gib = float(item["value"][1]) / (1024 ** 3)
-                info.setdefault(str(label), {})["memGb"] = round(gib) \
+                info.setdefault(_s(label, 64), {})["memGb"] = round(gib) \
                     if gib >= 10 else round(gib, 1)
             except (KeyError, IndexError, TypeError, ValueError):
                 pass
@@ -556,6 +602,7 @@ def attach_node_info(peers, info, aliases):
     """Aliases map inventory label -> exact tailnet short name. Labels with
     no alias fall back to an exact case-insensitive name match. Exact only:
     substring matching would let 'mac-studio' claim every studio."""
+    aliases = dict(list((aliases or {}).items())[:MAX_ALIASES])
     by_name = {p["name"].lower(): p for p in peers}
     for label, entry in info.items():
         target = str(aliases.get(label, label)).lower()
@@ -585,7 +632,7 @@ def collect_node_stats(vm_cfg, ns_cfg):
     url = str((vm_cfg or {}).get("url") or "")
     if not ns_cfg or not url:
         return {}
-    timeout = _num((vm_cfg or {}).get("timeoutSec"), 5)
+    timeout = min(30, _num((vm_cfg or {}).get("timeoutSec"), 5))
     label_key = str(ns_cfg.get("labelKey") or "node")
     out = {}
     for key in ("cpu", "mem"):
@@ -596,17 +643,18 @@ def collect_node_stats(vm_cfg, ns_cfg):
         result, _, error = query_instant(url, query, timeout)
         if error is not None or result is None:
             continue
-        for item in result:
+        for item in result[:MAX_STAT_ROWS]:
             label = (item.get("metric") or {}).get(label_key)
             if not label:
                 continue
+            label = _s(label, 64)
             try:
                 value = float(item["value"][1])
             except (KeyError, IndexError, TypeError, ValueError):
                 continue
             if value != value:
                 continue
-            out.setdefault(str(label), {})[key] = {
+            out.setdefault(label, {})[key] = {
                 "value": round(value, 1),
                 "display": _trim(value, 0) + "%",
                 "severity": rate_stat(value, spec.get("warn"),
@@ -617,6 +665,7 @@ def collect_node_stats(vm_cfg, ns_cfg):
 
 def attach_node_stats(peers, stats, aliases):
     """Same exact-match contract as attach_node_info."""
+    aliases = dict(list((aliases or {}).items())[:MAX_ALIASES])
     by_name = {p["name"].lower(): p for p in peers}
     for label, entry in stats.items():
         target = str(aliases.get(label, label)).lower()

@@ -36,6 +36,13 @@ collector treats failure as data:
 - When the report itself goes stale (collector stopped producing), the bar
   visibly drifts toward the muted shade and the footer says `STALE`.
 
+And all external data is treated as hostile: every string and series count
+crossing from config, Tailscale, or the metrics API into the report is
+length- and count-capped; metrics fetches accept only http(s) and refuse
+redirects; SSH substitutions accept only host-shaped values (a peer named
+like an ssh option is refused, never passed); dashboard clicks open only
+http(s) URLs; and a QML watchdog kills a wedged collector after 60s.
+
 ## Install
 
 ```
@@ -163,8 +170,8 @@ IPC: `qs ipc call stratoforce.fleetbar toggle` (also `open`, `close`, `refresh`)
 ## Tests
 
 ```
-python3 tests/test_collector.py   # 35 tests: sources, severity, formats, failure paths
-node tests/run-model-tests.mjs    # 14 tests: pure view-model helpers
+python3 tests/test_collector.py   # 40 tests: sources, severity, formats, failure and hardening paths
+node tests/run-model-tests.mjs    # 16 tests: pure view-model helpers
 ```
 
 ## License

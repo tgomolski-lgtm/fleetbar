@@ -338,6 +338,61 @@ class NodeStatsTests(unittest.TestCase):
         self.assertEqual(collector.collect_node_stats({}, {"cpu": {"query": "q"}}), {})
 
 
+class HardeningTests(unittest.TestCase):
+    def test_string_caps_and_ip_validation(self):
+        payload = {"Self": {"DNSName": ("x" * 500) + ".ts.net.",
+                            "HostName": "h" * 500,
+                            "TailscaleIPs": ["not-an-ip", "999.1.1.1",
+                                             "100.1.2.3", "fd7a::1"],
+                            "OS": "linux", "Online": True}}
+        with mock.patch.object(collector.subprocess, "run",
+                               return_value=ts_proc(payload)):
+            out = collector.collect_tailscale({})
+        peer = out["peers"][0]
+        self.assertLessEqual(len(peer["name"]), 64)
+        self.assertEqual(peer["ip"], "100.1.2.3")
+
+    def test_peer_count_cap(self):
+        payload = {"Self": {"DNSName": "s.x.", "HostName": "s",
+                            "TailscaleIPs": [], "OS": "linux", "Online": True},
+                   "Peer": {str(i): {"HostName": "p%d" % i, "Online": True,
+                                     "TailscaleIPs": [], "OS": "linux"}
+                            for i in range(collector.MAX_PEERS + 50)}}
+        with mock.patch.object(collector.subprocess, "run",
+                               return_value=ts_proc(payload)):
+            out = collector.collect_tailscale({"latency": False})
+        self.assertLessEqual(out["total"], collector.MAX_PEERS + 1)
+
+    def test_series_cap(self):
+        result = [{"metric": {"node": "n%d" % i}, "value": [0, "1"]}
+                  for i in range(collector.MAX_SERIES + 40)]
+        series, _, _ = collector.evaluate_check({"op": ">="}, result)
+        self.assertEqual(len(series), collector.MAX_SERIES)
+
+    def test_non_http_url_refused(self):
+        result, _, error = collector.query_instant("file:///etc", "up", 2)
+        self.assertIsNone(result)
+        self.assertIn("http(s)", error)
+
+    def test_redirects_refused(self):
+        import http.server, threading
+        class Redirector(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(302)
+                self.send_header("Location", "http://127.0.0.1:1/steal")
+                self.end_headers()
+            def log_message(self, *a): pass
+        srv = http.server.HTTPServer(("127.0.0.1", 0), Redirector)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            result, _, error = collector.query_instant(
+                "http://127.0.0.1:%d" % srv.server_port, "up", 3)
+            self.assertIsNone(result)
+            self.assertIsNotNone(error)
+        finally:
+            srv.shutdown()
+
+
 class VmErrorTests(unittest.TestCase):
     def test_unreachable_vm_marks_all_checks_unknown(self):
         vm, checks = collector.collect_checks(

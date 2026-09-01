@@ -118,7 +118,9 @@ Panel {
   }
 
   function openDashboard() {
-    if (dashboardUrl !== "") Quickshell.execDetached(["xdg-open", dashboardUrl])
+    // Only web URLs: xdg-open on an arbitrary scheme is a launcher.
+    if (Model.safeDashboardUrl(dashboardUrl))
+      Quickshell.execDetached(["xdg-open", dashboardUrl])
   }
 
   function copyPeerIp(peer) {
@@ -126,15 +128,15 @@ Panel {
   }
 
   // Opens the user's default terminal already connected to the node. The
-  // command template comes from the fleet config; naive whitespace split is
-  // documented — quoting inside the template is not supported.
+  // template is the user's own config; the peer-derived substitutions are
+  // validated host-shaped values (Model.sshArgv) so a peer named like an
+  // ssh option can never become one. Whitespace split is documented —
+  // quoting inside the template is not supported.
   function sshInto(peer) {
     if (!peer || !peer.online || peer.self) return
     var template = (report && report.sshCommand) ? report.sshCommand : "ssh {name}"
-    var cmd = template.replace("{name}", peer.name)
-      .replace("{ip}", peer.ip).replace("{host}", peer.host)
-    var parts = cmd.split(" ").filter(function(p) { return p !== "" })
-    if (parts.length > 0)
+    var parts = Model.sshArgv(template, peer)
+    if (parts !== null)
       Quickshell.execDetached(["omarchy-launch-terminal"].concat(parts))
   }
 
@@ -265,6 +267,18 @@ Panel {
       }
     }
     stderr: StdioCollector { waitForEnd: true }
+  }
+
+  // Watchdog: the collector bounds every source with its own timeout, but a
+  // wedged python process would otherwise hold `running` forever and block
+  // all future refreshes. 60s is several times the worst honest run.
+  Timer {
+    interval: 60000
+    running: collectorProc.running
+    onTriggered: {
+      collectorProc.running = false
+      root.collectorError = "collector killed after 60s watchdog"
+    }
   }
 
   Timer {

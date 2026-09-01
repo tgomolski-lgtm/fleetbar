@@ -11,7 +11,7 @@ const source = readFileSync(join(here, "..", "Model.js"), "utf8")
   .replace(/^\.pragma library$/m, "");
 const Model = new Function(`${source};
   return { severityRank, worstSeverity, barLabel, summaryLine, reportErrors,
-           relTime, osIcon, peerState, isStale, issueSummary, checkHeadline, checkDetail, peerDetail, peerBadge, issueFingerprint };`)();
+           relTime, osIcon, peerState, isStale, issueSummary, checkHeadline, checkDetail, peerDetail, peerBadge, issueFingerprint, safeSshValue, sshArgv, safeDashboardUrl };`)();
 
 let passed = 0;
 function test(name, fn) {
@@ -177,6 +177,32 @@ test("issueFingerprint changes when offenders change, stable otherwise", () => {
     vm: { enabled: true, ok: true, error: null }, configError: null };
   assert.equal(Model.issueFingerprint(healthy), "");
   assert.equal(Model.issueFingerprint(null), "");
+});
+
+
+test("sshArgv refuses option-shaped or hostile peer values", () => {
+  const peer = (name, ip) => ({ name, ip, host: name });
+  assert.deepEqual(Model.sshArgv("ssh {name}", peer("mini", "100.1.2.3")), ["ssh", "mini"]);
+  assert.deepEqual(Model.sshArgv("ssh -p 2222 {ip}", peer("mini", "100.1.2.3")),
+    ["ssh", "-p", "2222", "100.1.2.3"]);
+  // Peer name shaped like an ssh option: refused entirely.
+  assert.equal(Model.sshArgv("ssh {name}", peer("-oProxyCommand=evil", "100.1.2.3")), null);
+  // Whitespace smuggling: refused.
+  assert.equal(Model.sshArgv("ssh {name}", peer("mini evil", "100.1.2.3")), null);
+  // Empty substitution: refused.
+  assert.equal(Model.sshArgv("ssh {ip}", peer("mini", "")), null);
+  // Values not referenced by the template are not validated (unused).
+  assert.deepEqual(Model.sshArgv("ssh {ip}", { name: "-bad", ip: "100.1.2.3", host: "x" }),
+    ["ssh", "100.1.2.3"]);
+  assert.equal(Model.sshArgv("ssh {name}", null), null);
+});
+
+test("safeDashboardUrl allows only http(s)", () => {
+  assert.equal(Model.safeDashboardUrl("http://grafana:3131"), true);
+  assert.equal(Model.safeDashboardUrl("https://x.example"), true);
+  assert.equal(Model.safeDashboardUrl("file:///etc/passwd"), false);
+  assert.equal(Model.safeDashboardUrl("javascript:alert(1)"), false);
+  assert.equal(Model.safeDashboardUrl(""), false);
 });
 
 console.log(`\n${passed} tests passed`);

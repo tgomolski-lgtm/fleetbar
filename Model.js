@@ -175,6 +175,41 @@ function issueFingerprint(report) {
   return keys.sort().join("|");
 }
 
+// SSH template substitution values are peer-controlled (a tailnet admin or
+// a compromised peer chooses its own hostname). Only plain host-shaped
+// strings may reach the ssh argv: no leading dash (option injection), no
+// whitespace (argv splitting), only hostname/IP characters.
+var SAFE_SSH_VALUE_RE = /^[A-Za-z0-9][A-Za-z0-9.\-]{0,63}$/;
+
+function safeSshValue(value) {
+  return SAFE_SSH_VALUE_RE.test(String(value || ""));
+}
+
+// Builds the ssh argv from the config template, or null when any
+// substituted peer value fails validation. The template itself is the
+// user's own config (trusted like the rest of the file); only the
+// peer-derived substitutions are constrained.
+function sshArgv(template, peer) {
+  if (!peer) return null;
+  var text = String(template || "ssh {name}");
+  var used = [];
+  if (text.indexOf("{name}") !== -1) used.push(peer.name);
+  if (text.indexOf("{ip}") !== -1) used.push(peer.ip);
+  if (text.indexOf("{host}") !== -1) used.push(peer.host);
+  for (var i = 0; i < used.length; i++)
+    if (!safeSshValue(used[i])) return null;
+  text = text.replace("{name}", peer.name)
+             .replace("{ip}", peer.ip)
+             .replace("{host}", peer.host);
+  var parts = text.split(" ").filter(function(p) { return p !== ""; });
+  return parts.length > 0 ? parts : null;
+}
+
+// Dashboard clicks may only open web URLs.
+function safeDashboardUrl(url) {
+  return /^https?:\/\//i.test(String(url || ""));
+}
+
 function relTime(epochSeconds, nowMs) {
   if (!epochSeconds) return "never";
   var s = Math.max(0, Math.round(nowMs / 1000 - epochSeconds));
