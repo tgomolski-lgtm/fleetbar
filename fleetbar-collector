@@ -1,0 +1,425 @@
+#!/usr/bin/env python3
+"""fleetbar-collector — one JSON snapshot of your fleet's health.
+
+Reads a config file describing two sources — the local Tailscale daemon and a
+Prometheus-compatible HTTP API (VictoriaMetrics, Prometheus, Thanos, ...) —
+runs every configured check, and prints a single JSON document on stdout.
+
+Design contract with the QML side:
+  * Exit 0 whenever a report could be produced, even if every source failed.
+    Failures are data, not crashes: they ride in-band as `error` fields and
+    the "unknown" severity, so the UI can show WHAT is broken instead of
+    silently going stale. A non-zero exit means the collector itself is
+    broken (unreadable config path argument, Python error) and the UI shows
+    a collector error state.
+  * Never block long: every subprocess and HTTP call carries its own timeout,
+    and VM queries run concurrently, so worst-case wall time is bounded by
+    the slowest single source, not the sum.
+  * No secrets and no shell: subprocess uses list argv only, HTTP goes only
+    to the configured URL.
+"""
+
+import argparse
+import concurrent.futures
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+SEVERITY_RANK = {"ok": 0, "unknown": 1, "warn": 2, "crit": 3}
+VALID_OPS = {">": lambda v, t: v > t, ">=": lambda v, t: v >= t,
+             "<": lambda v, t: v < t, "<=": lambda v, t: v <= t,
+             "==": lambda v, t: v == t, "!=": lambda v, t: v != t}
+
+
+def worst(severities):
+    top = "ok"
+    for s in severities:
+        if SEVERITY_RANK.get(s, 1) > SEVERITY_RANK[top]:
+            top = s
+    return top
+
+
+# ---------------------------------------------------------------------------
+# Config
+
+DEFAULT_CONFIG_PATH = os.path.expanduser("~/.config/fleetbar/config.json")
+
+CONFIG_DEFAULTS = {
+    "fleetName": "Fleet",
+    "dashboardUrl": "",
+    "tailscale": {},
+    "victoriametrics": {},
+    "checks": [],
+}
+
+
+def load_config(path):
+    """Returns (config_dict, error_string_or_None). A missing or broken file
+    still yields a usable config (defaults) so the report explains itself."""
+    cfg = json.loads(json.dumps(CONFIG_DEFAULTS))  # deep copy
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            user = json.load(fh)
+    except FileNotFoundError:
+        return cfg, "config not found: %s" % path
+    except (OSError, json.JSONDecodeError) as exc:
+        return cfg, "config unreadable: %s" % exc
+    if not isinstance(user, dict):
+        return cfg, "config root must be a JSON object"
+    for key in cfg:
+        if key in user:
+            cfg[key] = user[key]
+    return cfg, None
+
+
+# ---------------------------------------------------------------------------
+# Tailscale
+
+def collect_tailscale(ts_cfg):
+    out = {"enabled": ts_cfg.get("enabled", True), "ok": False, "error": None,
+           "self": None, "peers": [], "online": 0, "total": 0,
+           "severity": "ok", "offlineExpected": []}
+    if not out["enabled"]:
+        out["ok"] = True
+        return out
+
+    timeout = _num(ts_cfg.get("timeoutSec"), 5)
+    try:
+        proc = subprocess.run(["tailscale", "status", "--json"],
+                              capture_output=True, text=True, timeout=timeout)
+    except FileNotFoundError:
+        out["error"] = "tailscale CLI not installed"
+        out["severity"] = "unknown"
+        return out
+    except subprocess.TimeoutExpired:
+        out["error"] = "tailscale status timed out after %gs" % timeout
+        out["severity"] = "unknown"
+        return out
+    if proc.returncode != 0:
+        out["error"] = (proc.stderr or "tailscale status failed").strip()[:200]
+        out["severity"] = "unknown"
+        return out
+    try:
+        status = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        out["error"] = "tailscale JSON unparsable: %s" % exc
+        out["severity"] = "unknown"
+        return out
+
+    hide_patterns = [re.compile(p, re.IGNORECASE)
+                     for p in ts_cfg.get("hidePatterns", []) if _safe_re(p)]
+    hide_os = {str(o).lower() for o in ts_cfg.get("hideOS", [])}
+    expect = [str(e).lower() for e in ts_cfg.get("expect", [])]
+    offline_sev = ts_cfg.get("offlineSeverity", "warn")
+    if offline_sev not in SEVERITY_RANK:
+        offline_sev = "warn"
+
+    def normalize(node, is_self):
+        dns = str(node.get("DNSName") or "")
+        name = dns.split(".")[0] if dns else str(node.get("HostName") or "?")
+        ips = [ip for ip in (node.get("TailscaleIPs") or []) if "." in ip]
+        return {
+            "name": name,
+            "host": str(node.get("HostName") or name),
+            "ip": ips[0] if ips else "",
+            "os": str(node.get("OS") or ""),
+            "online": bool(node.get("Online")) or is_self,
+            "lastSeen": str(node.get("LastSeen") or ""),
+            "self": is_self,
+            "expected": False,
+        }
+
+    nodes = []
+    if isinstance(status.get("Self"), dict):
+        nodes.append(normalize(status["Self"], True))
+    for peer in (status.get("Peer") or {}).values():
+        nodes.append(normalize(peer, False))
+
+    def hidden(n):
+        if n["os"].lower() in hide_os:
+            return True
+        # Patterns are tried against name and host separately so anchored
+        # expressions like ^localhost$ behave as expected.
+        return any(p.search(n["name"]) or p.search(n["host"])
+                   for p in hide_patterns)
+
+    nodes = [n for n in nodes if not hidden(n)]
+    for n in nodes:
+        hay = (n["name"] + " " + n["host"]).lower()
+        n["expected"] = any(e in hay for e in expect)
+    # Self first, then online before offline, each group alphabetical.
+    nodes.sort(key=lambda n: (not n["self"], not n["online"], n["name"].lower()))
+
+    out["ok"] = True
+    out["self"] = next((n for n in nodes if n["self"]), None)
+    out["peers"] = nodes
+    out["online"] = sum(1 for n in nodes if n["online"])
+    out["total"] = len(nodes)
+    out["offlineExpected"] = [n["name"] for n in nodes
+                              if n["expected"] and not n["online"]]
+    if out["offlineExpected"]:
+        out["severity"] = offline_sev
+    return out
+
+
+def _safe_re(pattern):
+    try:
+        re.compile(str(pattern))
+        return True
+    except re.error:
+        return False
+
+
+def _num(value, fallback):
+    try:
+        n = float(value)
+        return n if n > 0 else fallback
+    except (TypeError, ValueError):
+        return fallback
+
+
+# ---------------------------------------------------------------------------
+# Prometheus-compatible source
+
+def query_instant(base_url, query, timeout):
+    """Returns (result_list, latency_ms, error). result_list is the raw
+    vector `result` array from the API."""
+    url = base_url.rstrip("/") + "/api/v1/query?" + urllib.parse.urlencode(
+        {"query": query})
+    started = time.monotonic()
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            body = resp.read(4 * 1024 * 1024)
+    except urllib.error.HTTPError as exc:
+        return None, _ms(started), "HTTP %s from %s" % (exc.code, exc.reason)
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        reason = getattr(exc, "reason", exc)
+        return None, _ms(started), "unreachable: %s" % reason
+    try:
+        doc = json.loads(body)
+    except json.JSONDecodeError:
+        return None, _ms(started), "response is not JSON"
+    if doc.get("status") != "success":
+        return None, _ms(started), str(doc.get("error") or "query failed")[:200]
+    data = doc.get("data") or {}
+    if data.get("resultType") != "vector":
+        return None, _ms(started), "expected instant vector, got %s" % (
+            data.get("resultType"))
+    return data.get("result") or [], _ms(started), None
+
+
+def _ms(started):
+    return round((time.monotonic() - started) * 1000)
+
+
+LABEL_PREFERENCE = ("node", "host", "instance", "job")
+
+
+def series_label(metric, label_key):
+    if label_key and metric.get(label_key):
+        return str(metric[label_key])
+    for key in LABEL_PREFERENCE:
+        if metric.get(key):
+            return str(metric[key])
+    named = {k: v for k, v in metric.items() if k != "__name__"}
+    return ",".join("%s=%s" % kv for kv in sorted(named.items())) or "value"
+
+
+def evaluate_check(check, result):
+    """Turns a raw vector into rated series rows plus a check severity."""
+    op_name = str(check.get("op", ">="))
+    op = VALID_OPS.get(op_name)
+    warn = check.get("warn")
+    crit = check.get("crit")
+    fmt = str(check.get("format", "number"))
+    unit = str(check.get("unit", ""))
+    decimals = int(_num(check.get("decimals"), 1))
+    label_key = check.get("labelKey")
+
+    series = []
+    for item in result:
+        try:
+            value = float(item["value"][1])
+        except (KeyError, IndexError, TypeError, ValueError):
+            continue
+        severity = "ok"
+        if op is not None and value == value:  # NaN-guard
+            if crit is not None and op(value, float(crit)):
+                severity = "crit"
+            elif warn is not None and op(value, float(warn)):
+                severity = "warn"
+        elif value != value:
+            severity = "unknown"
+        series.append({
+            "label": series_label(item.get("metric") or {}, label_key),
+            "value": value,
+            "display": format_value(value, fmt, unit, decimals),
+            "severity": severity,
+        })
+    series.sort(key=lambda s: (-SEVERITY_RANK.get(s["severity"], 1),
+                               s["label"].lower()))
+    if not series:
+        return series, "unknown", "query returned no data"
+    return series, worst(s["severity"] for s in series), None
+
+
+def format_value(value, fmt, unit, decimals):
+    if fmt == "updown":
+        return "up" if value >= 1 else "DOWN"
+    if fmt == "percent":
+        return _trim(value, decimals) + "%"
+    if fmt == "bytes":
+        mag = abs(value)
+        for suffix in ("B", "KiB", "MiB", "GiB", "TiB", "PiB"):
+            if mag < 1024 or suffix == "PiB":
+                return _trim(value, decimals) + " " + suffix
+            value /= 1024.0
+            mag /= 1024.0
+    if fmt == "seconds":
+        seconds = int(value)
+        if seconds < 90:
+            return "%ds" % seconds
+        if seconds < 5400:
+            return "%dm" % round(seconds / 60)
+        if seconds < 129600:
+            return "%.1fh" % (seconds / 3600)
+        return "%.1fd" % (seconds / 86400)
+    text = _trim(value, decimals)
+    return text + (" " + unit if unit else "")
+
+
+def _trim(value, decimals):
+    text = "%.*f" % (max(0, decimals), value)
+    return text.rstrip("0").rstrip(".") if "." in text else text
+
+
+def collect_checks(vm_cfg, checks_cfg):
+    vm = {"enabled": bool(vm_cfg.get("url")), "url": str(vm_cfg.get("url") or ""),
+          "ok": False, "error": None, "latencyMs": None}
+    checks = []
+    if not vm["enabled"]:
+        if checks_cfg:
+            vm["error"] = "victoriametrics.url not configured"
+        else:
+            vm["ok"] = True
+        for check in checks_cfg:
+            checks.append(_check_shell(check, "unknown",
+                                       "no metrics source configured"))
+        return vm, checks
+
+    timeout = _num(vm_cfg.get("timeoutSec"), 5)
+
+    def run_one(check):
+        query = str(check.get("query") or "")
+        if not query:
+            return check, None, None, "check has no query"
+        return (check,) + query_instant(vm["url"], query, timeout)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+        results = list(pool.map(run_one, checks_cfg))
+
+    latencies = []
+    any_reachable = False
+    for check, result, latency, error in results:
+        if latency is not None:
+            latencies.append(latency)
+        if error is None and result is not None:
+            any_reachable = True
+            series, severity, eval_error = evaluate_check(check, result)
+            checks.append(_check_shell(check, severity, eval_error,
+                                       series=series))
+        else:
+            checks.append(_check_shell(check, "unknown", error))
+    vm["ok"] = any_reachable or not checks_cfg
+    vm["latencyMs"] = max(latencies) if latencies else None
+    if not any_reachable and checks_cfg:
+        vm["error"] = next((c["error"] for c in checks if c["error"]),
+                           "all queries failed")
+    return vm, checks
+
+
+def _check_shell(check, severity, error, series=None):
+    return {
+        "id": str(check.get("id") or check.get("name") or "check"),
+        "name": str(check.get("name") or check.get("id") or "Check"),
+        "severity": severity,
+        "error": error,
+        "series": series or [],
+        "op": str(check.get("op", ">=")),
+        "warn": check.get("warn"),
+        "crit": check.get("crit"),
+        "format": str(check.get("format", "number")),
+        "unit": str(check.get("unit", "")),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Report
+
+def build_report(config_path):
+    started = time.monotonic()
+    cfg, cfg_error = load_config(config_path)
+    tailscale = collect_tailscale(cfg.get("tailscale") or {})
+    vm, checks = collect_checks(cfg.get("victoriametrics") or {},
+                                cfg.get("checks") or [])
+
+    severities = [tailscale["severity"]]
+    severities += [c["severity"] for c in checks]
+    if cfg_error:
+        severities.append("unknown")
+    if not tailscale["ok"] and tailscale["enabled"]:
+        severities.append("unknown")
+
+    issue_counts = {"crit": 0, "warn": 0, "unknown": 0}
+    for c in checks:
+        if c["severity"] in issue_counts:
+            issue_counts[c["severity"]] += 1
+    if tailscale["severity"] in issue_counts:
+        issue_counts[tailscale["severity"]] += 1
+    if (not tailscale["ok"] and tailscale["enabled"]) or cfg_error:
+        issue_counts["unknown"] += 1
+
+    return {
+        "version": 1,
+        "generatedAt": int(time.time()),
+        "durationMs": _ms(started),
+        "fleetName": str(cfg.get("fleetName") or "Fleet"),
+        "dashboardUrl": str(cfg.get("dashboardUrl") or ""),
+        "configPath": config_path,
+        "configError": cfg_error,
+        "tailscale": tailscale,
+        "vm": vm,
+        "checks": checks,
+        "summary": {
+            "severity": worst(severities),
+            "crit": issue_counts["crit"],
+            "warn": issue_counts["warn"],
+            "unknown": issue_counts["unknown"],
+            "issues": sum(issue_counts.values()),
+            "peersOnline": tailscale["online"],
+            "peersTotal": tailscale["total"],
+        },
+    }
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--config", default=DEFAULT_CONFIG_PATH,
+                        help="fleet config JSON (default: %(default)s)")
+    parser.add_argument("--pretty", action="store_true",
+                        help="indent the JSON output")
+    args = parser.parse_args(argv)
+    report = build_report(os.path.expanduser(args.config))
+    json.dump(report, sys.stdout, indent=2 if args.pretty else None)
+    sys.stdout.write("\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

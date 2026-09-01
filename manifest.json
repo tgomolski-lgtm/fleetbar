@@ -1,0 +1,50 @@
+{
+  "schemaVersion": 1,
+  "id": "stratoforce.fleetbar",
+  "name": "Fleetbar",
+  "version": "1.0.0",
+  "author": "StratoForce AI",
+  "license": "MIT",
+  "description": "Your fleet's heartbeat in the bar: Tailscale node status plus any Prometheus/VictoriaMetrics checks with thresholds — failures surface explicitly, never as silent green.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Fleetbar",
+    "description": "Click: fleet panel. Middle click: force refresh. Right click: open your dashboard.",
+    "category": "System",
+    "aliases": [
+      "fleet",
+      "tailnet",
+      "homelab"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 60,
+      "showLabel": true
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "description": "How often the collector polls Tailscale and your metrics source. Opening the panel and middle-clicking both force a refresh.",
+        "min": 15,
+        "max": 3600,
+        "step": 15,
+        "defaultValue": 60
+      },
+      {
+        "key": "showLabel",
+        "type": "boolean",
+        "label": "Show node count next to the icon",
+        "description": "Horizontal bars only; the icon alone still carries severity color, and issues always append a !N marker.",
+        "defaultValue": true
+      }
+    ]
+  }
+}

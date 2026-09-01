@@ -1,0 +1,48 @@
+{
+  "fleetName": "Homelab",
+  "dashboardUrl": "http://grafana.example:3000",
+
+  "tailscale": {
+    "enabled": true,
+    "timeoutSec": 5,
+    "hidePatterns": ["^localhost$"],
+    "hideOS": ["iOS", "android"],
+    "expect": ["server1", "nas", "pi-"],
+    "offlineSeverity": "warn"
+  },
+
+  "victoriametrics": {
+    "url": "http://vm.example:8428",
+    "timeoutSec": 5
+  },
+
+  "checks": [
+    {
+      "id": "node-up",
+      "name": "Node exporters",
+      "query": "min by (node) (up{job=~\"node-.*\"})",
+      "op": "<",
+      "crit": 1,
+      "format": "updown"
+    },
+    {
+      "id": "disk",
+      "name": "Disk used",
+      "query": "max by (node) (100 - 100 * node_filesystem_avail_bytes{fstype!~\"tmpfs|devtmpfs\"} / node_filesystem_size_bytes)",
+      "op": ">=",
+      "warn": 85,
+      "crit": 95,
+      "format": "percent"
+    },
+    {
+      "id": "mem",
+      "name": "Memory used",
+      "query": "100 * (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)",
+      "labelKey": "node",
+      "op": ">=",
+      "warn": 90,
+      "crit": 97,
+      "format": "percent"
+    }
+  ]
+}
