@@ -104,8 +104,24 @@ short name (exact match only — substrings would misassign lookalikes):
 }
 ```
 
-Identity and latency are decoration: a failed probe or query leaves the
-field blank, never fakes a value, and never fails the node.
+Live utilization badges per row come from `nodeStats` — two queries whose
+per-label results attach to nodes through the same exact-match aliases
+(PromQL `or` unions mixed exporters, e.g. telegraf Macs + node_exporter
+Linux boxes):
+
+```jsonc
+"nodeStats": {
+  "labelKey": "node",
+  "aliases": { "mini": "my-mini" },
+  "cpu": { "query": "cpu_usage_active{cpu=\"cpu-total\"} or (100 - avg by (node) (rate(node_cpu_seconds_total{mode=\"idle\"}[2m]) * 100))", "warn": 85, "crit": 95 },
+  "mem": { "query": "mem_used_percent or (100 * (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes))", "warn": 90, "crit": 97 }
+}
+```
+
+Badges color by their own thresholds but never feed the fleet severity —
+checks do the alerting. Identity, latency, and stats are all decoration: a
+failed probe or query leaves the field blank, never fakes a value, and
+never fails the node.
 
 Global history tuning (optional, top-level): `"history": {"enabled": true,
 "spanSec": 10800, "points": 40}` — the sparkline is a range query over
@@ -147,7 +163,7 @@ IPC: `qs ipc call stratoforce.fleetbar toggle` (also `open`, `close`, `refresh`)
 ## Tests
 
 ```
-python3 tests/test_collector.py   # 32 tests: sources, severity, formats, failure paths
+python3 tests/test_collector.py   # 35 tests: sources, severity, formats, failure paths
 node tests/run-model-tests.mjs    # 14 tests: pure view-model helpers
 ```
 

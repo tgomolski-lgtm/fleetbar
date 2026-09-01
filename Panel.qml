@@ -314,7 +314,7 @@ Panel {
     open: root.opened
     centerOnBar: true
     focusTarget: keyCatcher
-    contentWidth: panel.fittedContentWidth(Style.space(440))
+    contentWidth: panel.fittedContentWidth(Style.space(490))
     contentHeight: panel.fittedContentHeight(fleetColumn.implicitHeight + Style.space(32))
 
     PanelKeyCatcher {
@@ -602,14 +602,56 @@ Panel {
                     }
                   }
 
-                  Text {
-                    visible: text !== ""
-                    textFormat: Text.PlainText
-                    text: Model.peerBadge(nodeRow.modelData)
-                    color: root.dim
-                    font.family: root.bar ? root.bar.fontFamily : Style.font.family
-                    font.pixelSize: Style.font.caption
+                  ColumnLayout {
+                    visible: latencyText.text !== "" || statsRow.visible
+                    spacing: Style.space(1)
                     Layout.alignment: Qt.AlignVCenter
+
+                    Text {
+                      id: latencyText
+                      visible: text !== ""
+                      textFormat: Text.PlainText
+                      text: Model.peerBadge(nodeRow.modelData)
+                      color: root.dim
+                      font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                      font.pixelSize: Style.font.caption
+                      Layout.alignment: Qt.AlignRight
+                    }
+
+                    // Live utilization badges. Purely informational: their
+                    // colors follow the configured stat thresholds, but they
+                    // never feed the fleet severity — checks do the alerting.
+                    Row {
+                      id: statsRow
+                      readonly property var stats: nodeRow.modelData.stats || null
+                      visible: stats !== null
+                      spacing: Style.space(6)
+                      Layout.alignment: Qt.AlignRight
+
+                      Text {
+                        visible: statsRow.stats && statsRow.stats.cpu !== undefined
+                        textFormat: Text.PlainText
+                        text: statsRow.stats && statsRow.stats.cpu ? "\uf2db " + statsRow.stats.cpu.display : ""
+                        color: statsRow.stats && statsRow.stats.cpu
+                          ? (statsRow.stats.cpu.severity === "ok" ? root.dim
+                             : root.severityColor(statsRow.stats.cpu.severity, root.panelFg))
+                          : root.dim
+                        font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                        font.pixelSize: Style.font.caption
+                      }
+
+                      Text {
+                        visible: statsRow.stats && statsRow.stats.mem !== undefined
+                        textFormat: Text.PlainText
+                        text: statsRow.stats && statsRow.stats.mem ? "\udb80\udf5b " + statsRow.stats.mem.display : ""
+                        color: statsRow.stats && statsRow.stats.mem
+                          ? (statsRow.stats.mem.severity === "ok" ? root.dim
+                             : root.severityColor(statsRow.stats.mem.severity, root.panelFg))
+                          : root.dim
+                        font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                        font.pixelSize: Style.font.caption
+                      }
+                    }
                   }
 
                   PanelActionButton {

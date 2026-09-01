@@ -304,6 +304,40 @@ class LatencyAndIdentityTests(unittest.TestCase):
         self.assertEqual(peers[2]["identity"], "FX-8350 · 8c · 16G")
 
 
+class NodeStatsTests(unittest.TestCase):
+    def test_rate_stat_thresholds(self):
+        self.assertEqual(collector.rate_stat(50, 85, 95), "ok")
+        self.assertEqual(collector.rate_stat(86, 85, 95), "warn")
+        self.assertEqual(collector.rate_stat(96, 85, 95), "crit")
+        self.assertEqual(collector.rate_stat(99, None, None), "ok")
+
+    def test_collect_and_attach_stats(self):
+        vec = [{"metric": {"node": "mini"}, "value": [0, "19.4"]},
+               {"metric": {"node": "ghost"}, "value": [0, "5"]},
+               {"metric": {"node": "bad"}, "value": [0, "NaN"]}]
+        with mock.patch.object(collector, "query_instant",
+                               return_value=(vec, 3, None)):
+            stats = collector.collect_node_stats(
+                {"url": "http://x"}, {"cpu": {"query": "q", "warn": 85}})
+        self.assertEqual(stats["mini"]["cpu"]["display"], "19%")
+        self.assertEqual(stats["mini"]["cpu"]["severity"], "ok")
+        self.assertNotIn("bad", stats)
+        peers = [{"name": "tommys-mac-mini-1", "stats": None},
+                 {"name": "other", "stats": None}]
+        collector.attach_node_stats(peers, stats,
+                                    {"mini": "tommys-mac-mini-1"})
+        self.assertIsNotNone(peers[0]["stats"])
+        self.assertIsNone(peers[1]["stats"])
+
+    def test_stats_failure_yields_no_badges(self):
+        with mock.patch.object(collector, "query_instant",
+                               return_value=(None, None, "boom")):
+            stats = collector.collect_node_stats(
+                {"url": "http://x"}, {"cpu": {"query": "q"}})
+        self.assertEqual(stats, {})
+        self.assertEqual(collector.collect_node_stats({}, {"cpu": {"query": "q"}}), {})
+
+
 class VmErrorTests(unittest.TestCase):
     def test_unreachable_vm_marks_all_checks_unknown(self):
         vm, checks = collector.collect_checks(

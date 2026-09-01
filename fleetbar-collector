@@ -60,6 +60,7 @@ CONFIG_DEFAULTS = {
     "checks": [],
     "history": {},
     "nodeInfo": {},
+    "nodeStats": {},
 }
 
 
@@ -140,6 +141,7 @@ def collect_tailscale(ts_cfg):
             "latencyMs": None,
             "path": None,
             "identity": None,
+            "stats": None,
             "self": is_self,
             "expected": False,
         }
@@ -565,6 +567,65 @@ def attach_node_info(peers, info, aliases):
 
 
 # ---------------------------------------------------------------------------
+# Live per-node stats: current utilization badges on the node rows
+
+def rate_stat(value, warn, crit):
+    breach = VALID_OPS[">="]
+    if crit is not None and breach(value, float(crit)):
+        return "crit"
+    if warn is not None and breach(value, float(warn)):
+        return "warn"
+    return "ok"
+
+
+def collect_node_stats(vm_cfg, ns_cfg):
+    """Returns {label: {"cpu"/"mem": {value, display, severity}}}. Purely
+    decorative: badges never feed the fleet severity (checks do alerting),
+    and a failed query simply yields no badge."""
+    url = str((vm_cfg or {}).get("url") or "")
+    if not ns_cfg or not url:
+        return {}
+    timeout = _num((vm_cfg or {}).get("timeoutSec"), 5)
+    label_key = str(ns_cfg.get("labelKey") or "node")
+    out = {}
+    for key in ("cpu", "mem"):
+        spec = ns_cfg.get(key) or {}
+        query = str(spec.get("query") or "")
+        if not query:
+            continue
+        result, _, error = query_instant(url, query, timeout)
+        if error is not None or result is None:
+            continue
+        for item in result:
+            label = (item.get("metric") or {}).get(label_key)
+            if not label:
+                continue
+            try:
+                value = float(item["value"][1])
+            except (KeyError, IndexError, TypeError, ValueError):
+                continue
+            if value != value:
+                continue
+            out.setdefault(str(label), {})[key] = {
+                "value": round(value, 1),
+                "display": _trim(value, 0) + "%",
+                "severity": rate_stat(value, spec.get("warn"),
+                                      spec.get("crit")),
+            }
+    return out
+
+
+def attach_node_stats(peers, stats, aliases):
+    """Same exact-match contract as attach_node_info."""
+    by_name = {p["name"].lower(): p for p in peers}
+    for label, entry in stats.items():
+        target = str(aliases.get(label, label)).lower()
+        peer = by_name.get(target)
+        if peer is not None and entry:
+            peer["stats"] = entry
+
+
+# ---------------------------------------------------------------------------
 # Report
 
 def build_report(config_path):
@@ -580,6 +641,13 @@ def build_report(config_path):
         attach_node_info(tailscale["peers"],
                          collect_node_info(cfg.get("victoriametrics"), ni_cfg),
                          ni_cfg.get("aliases") or {})
+
+    ns_cfg = cfg.get("nodeStats") or {}
+    if ns_cfg and tailscale["peers"]:
+        attach_node_stats(tailscale["peers"],
+                          collect_node_stats(cfg.get("victoriametrics"),
+                                             ns_cfg),
+                          ns_cfg.get("aliases") or {})
 
     severities = [tailscale["severity"]]
     severities += [c["severity"] for c in checks]
