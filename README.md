@@ -109,8 +109,8 @@ IPC: `qs ipc call stratoforce.fleetbar toggle` (also `open`, `close`, `refresh`)
 ## Tests
 
 ```
-python3 tests/test_collector.py   # 22 tests: sources, severity, formats, failure paths
-node tests/run-model-tests.mjs    # 8 tests: pure view-model helpers
+python3 tests/test_collector.py   # 28 tests: sources, severity, formats, failure paths
+node tests/run-model-tests.mjs    # 9 tests: pure view-model helpers
 ```
 
 ## License
