@@ -11,7 +11,7 @@ const source = readFileSync(join(here, "..", "Model.js"), "utf8")
   .replace(/^\.pragma library$/m, "");
 const Model = new Function(`${source};
   return { severityRank, worstSeverity, barLabel, summaryLine, reportErrors,
-           relTime, osIcon, peerState, isStale };`)();
+           relTime, osIcon, peerState, isStale, issueSummary };`)();
 
 let passed = 0;
 function test(name, fn) {
@@ -91,6 +91,28 @@ test("isStale respects the 2.5x + grace horizon", () => {
 test("osIcon maps known systems and falls back", () => {
   assert.notEqual(Model.osIcon("linux"), Model.osIcon("macOS"));
   assert.equal(Model.osIcon("weirdOS"), Model.osIcon(""));
+});
+
+test("issueSummary names offenders, skips healthy, caps length", () => {
+  const report = {
+    checks: [
+      { name: "Gateways", severity: "crit", error: null, series: [
+        { label: "studio2", display: "DOWN", severity: "crit" },
+        { label: "mini", display: "up", severity: "ok" }] },
+      { name: "Disk", severity: "ok", error: null, series: [
+        { label: "droplet", display: "26%", severity: "ok" }] },
+      { name: "Cron", severity: "unknown", error: "no data", series: [] },
+    ],
+    tailscale: { enabled: true, ok: true, error: null, offlineExpected: ["nas"] },
+    vm: { enabled: true, ok: true, error: null },
+    configError: null,
+  };
+  assert.equal(Model.issueSummary(report, 180),
+    "Gateways: studio2 DOWN · Cron: no data · offline: nas");
+  const capped = Model.issueSummary(report, 20);
+  assert.equal(capped.length, 20);
+  assert.ok(capped.endsWith("…"));
+  assert.equal(Model.issueSummary(null, 180), "");
 });
 
 console.log(`\n${passed} tests passed`);

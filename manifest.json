@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "stratoforce.fleetbar",
   "name": "Fleetbar",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "StratoForce AI",
   "license": "MIT",
   "description": "Your fleet's heartbeat in the bar: Tailscale node status plus any Prometheus/VictoriaMetrics checks with thresholds — failures surface explicitly, never as silent green.",
@@ -25,7 +25,8 @@
     "defaultSection": "right",
     "defaults": {
       "refreshIntervalSec": 60,
-      "showLabel": true
+      "showLabel": true,
+      "notifyOnChange": true
     },
     "schema": [
       {
@@ -43,6 +44,13 @@
         "type": "boolean",
         "label": "Show node count next to the icon",
         "description": "Horizontal bars only; the icon alone still carries severity color, and issues always append a !N marker.",
+        "defaultValue": true
+      },
+      {
+        "key": "notifyOnChange",
+        "type": "boolean",
+        "label": "Notify on severity changes",
+        "description": "Desktop notification when the fleet's overall severity changes — what broke, or that it recovered. Flap-guarded to at most one ping per five minutes; a shell restart never re-announces an ongoing incident.",
         "defaultValue": true
       }
     ]

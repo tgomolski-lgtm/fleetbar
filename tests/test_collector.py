@@ -208,6 +208,47 @@ class ConfigAndReportTests(unittest.TestCase):
         self.assertEqual(doc["summary"]["severity"], "unknown")
 
 
+class HistoryTests(unittest.TestCase):
+    def matrix(self, *series):
+        return [{"metric": m, "values": v} for m, v in series]
+
+    def test_max_aggregation_default(self):
+        trace = collector.aggregate_history(self.matrix(
+            ({"node": "a"}, [[100, "1"], [200, "5"]]),
+            ({"node": "b"}, [[100, "3"], [200, "2"]])), ">=", 40)
+        self.assertEqual(trace, [3.0, 5.0])
+
+    def test_min_aggregation_for_less_than(self):
+        trace = collector.aggregate_history(self.matrix(
+            ({"node": "a"}, [[100, "1"], [200, "1"]]),
+            ({"node": "b"}, [[100, "0"], [200, "1"]])), "<", 40)
+        self.assertEqual(trace, [0.0, 1.0])
+
+    def test_unaligned_timestamps_merge_sorted(self):
+        trace = collector.aggregate_history(self.matrix(
+            ({"node": "a"}, [[300, "3"]]),
+            ({"node": "b"}, [[100, "1"]])), ">=", 40)
+        self.assertEqual(trace, [1.0, 3.0])
+
+    def test_points_cap_keeps_newest(self):
+        values = [[i, str(i)] for i in range(10)]
+        trace = collector.aggregate_history(self.matrix(({}, values)), ">=", 3)
+        self.assertEqual(trace, [7.0, 8.0, 9.0])
+
+    def test_garbage_and_empty(self):
+        self.assertEqual(collector.aggregate_history(None, ">=", 10), [])
+        trace = collector.aggregate_history(self.matrix(
+            ({}, [[100, "nope"], [200, "NaN"], [300, "2"]])), ">=", 10)
+        self.assertEqual(trace, [2.0])
+
+    def test_check_shell_carries_history(self):
+        shell = collector._check_shell({"id": "x"}, "ok", None,
+                                       history=[1.0, 2.0])
+        self.assertEqual(shell["history"], [1.0, 2.0])
+        self.assertEqual(collector._check_shell({"id": "x"}, "ok",
+                                                None)["history"], [])
+
+
 class VmErrorTests(unittest.TestCase):
     def test_unreachable_vm_marks_all_checks_unknown(self):
         vm, checks = collector.collect_checks(

@@ -39,6 +39,7 @@ Panel {
 
   readonly property int refreshIntervalSec: intSetting("refreshIntervalSec", 60, 15, 3600)
   readonly property bool showLabel: setting("showLabel", true) === true
+  readonly property bool notifyOnChange: setting("notifyOnChange", true) === true
   readonly property bool stale: Model.isStale(report ? report.generatedAt : 0, nowMs, refreshIntervalSec)
 
   readonly property string severity: {
@@ -116,6 +117,37 @@ Panel {
     if (peer && peer.ip) Quickshell.execDetached(["wl-copy", String(peer.ip)])
   }
 
+  // ---- Sentinel: desktop notification on severity transitions ------------
+
+  // "" = no report seen yet: the first report sets the baseline silently, so
+  // a shell restart during an ongoing incident doesn't re-announce it.
+  property string lastNotifiedSeverity: ""
+  property double lastNotifyMs: 0
+
+  function maybeNotify() {
+    if (!summary) return
+    var sev = summary.severity
+    if (lastNotifiedSeverity === "") { lastNotifiedSeverity = sev; return }
+    if (sev === lastNotifiedSeverity) return
+    var previous = lastNotifiedSeverity
+    lastNotifiedSeverity = sev
+    if (!notifyOnChange) return
+    // Flap guard: state always tracks truth above, but at most one ping per
+    // five minutes — a bouncing check can't spam the desktop.
+    var now = Date.now()
+    if (now - lastNotifyMs < 300000) return
+    lastNotifyMs = now
+    var urgency = sev === "crit" ? "critical" : sev === "ok" ? "low" : "normal"
+    var headline = sev === "ok"
+      ? fleetName + ": recovered"
+      : fleetName + ": " + sev.toUpperCase()
+    var body = sev === "ok"
+      ? "all checks passing (was " + previous + ")"
+      : Model.issueSummary(report, 180)
+    Quickshell.execDetached(["omarchy-notification-send", "-u", urgency,
+                             "-g", barGlyph, headline, body])
+  }
+
   // ---- Panel plumbing (weather-pattern popout contract) -----------------
 
   function open() {
@@ -177,6 +209,7 @@ Panel {
           root.report = doc
           root.collectorError = ""
           root.nowMs = Date.now()
+          root.maybeNotify()
         } catch (e) {
           root.collectorError = "collector output unparsable"
         }
@@ -466,6 +499,7 @@ Panel {
                   }
 
                   Text {
+                    id: checkStatus
                     text: modelData.error ? modelData.error
                       : (modelData.severity === "ok" ? "ok" : modelData.severity)
                     color: root.severityColor(modelData.severity, Color.muted)
@@ -473,6 +507,67 @@ Panel {
                     font.pixelSize: Style.font.caption
                     anchors.right: parent.right
                     anchors.verticalCenter: parent.verticalCenter
+                  }
+
+                  // Worst-direction trend over the configured history span.
+                  Canvas {
+                    id: spark
+                    visible: (modelData.history || []).length >= 2
+                    width: Style.space(56)
+                    height: Style.space(12)
+                    anchors.right: checkStatus.left
+                    anchors.rightMargin: Style.space(10)
+                    anchors.verticalCenter: parent.verticalCenter
+
+                    antialiasing: true
+
+                    readonly property var trace: modelData.history || []
+                    readonly property color lineColor: root.tinted(
+                      root.severityColor(modelData.severity, Color.popups.text),
+                      modelData.severity === "ok" ? 0.55 : 0.9)
+
+                    // A Canvas that is created hidden (or before its backing
+                    // store exists) drops requestPaint silently — every
+                    // trigger that can make it drawable must re-request.
+                    onTraceChanged: requestPaint()
+                    onLineColorChanged: requestPaint()
+                    onVisibleChanged: if (visible) requestPaint()
+                    onAvailableChanged: if (available) requestPaint()
+                    onWidthChanged: requestPaint()
+                    onHeightChanged: requestPaint()
+
+                    onPaint: {
+                      var ctx = getContext("2d")
+                      ctx.clearRect(0, 0, width, height)
+                      var data = trace
+                      if (data.length < 2) return
+                      var lo = Infinity, hi = -Infinity
+                      for (var i = 0; i < data.length; i++) {
+                        if (data[i] === null) continue
+                        if (data[i] < lo) lo = data[i]
+                        if (data[i] > hi) hi = data[i]
+                      }
+                      if (lo === Infinity) return
+                      // A flat trace still draws: pad the range so the line
+                      // sits mid-height instead of dividing by zero.
+                      if (hi - lo < 1e-9) { hi += 1; lo -= 1 }
+                      var pad = 1.5
+                      ctx.strokeStyle = lineColor
+                      ctx.lineWidth = 1.2
+                      ctx.lineJoin = "round"
+                      ctx.beginPath()
+                      var started = false
+                      for (var j = 0; j < data.length; j++) {
+                        if (data[j] === null) { started = false; continue }
+                        var x = data.length === 1 ? 0
+                          : j / (data.length - 1) * (width - 1)
+                        var y = pad + (1 - (data[j] - lo) / (hi - lo))
+                          * (height - pad * 2)
+                        if (!started) { ctx.moveTo(x, y); started = true }
+                        else ctx.lineTo(x, y)
+                      }
+                      ctx.stroke()
+                    }
                   }
                 }
 

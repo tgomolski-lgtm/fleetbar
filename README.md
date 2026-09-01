@@ -11,8 +11,16 @@ metrics source (VictoriaMetrics, Prometheus, Thanos, Mimir, ...).
 
 The bar shows `7/8` (nodes online) and appends `!N` when anything needs
 attention. Click for the full panel: node chips with online state, OS and
-click-to-copy IPs, every check with its per-series values, and an honest
-footer with data age and collection latency.
+click-to-copy IPs, every check with its per-series values and a **sparkline
+trend** (worst-direction fold of the check's history), and an honest footer
+with data age and collection latency.
+
+**It's a sentinel, not just a dashboard**: when the fleet's overall severity
+changes, Fleetbar sends a desktop notification naming exactly what broke —
+`Busta Fleet: WARN — Disk used: omarchy 45.3%` — and one when it recovers.
+Notifications are transition-based and flap-guarded (at most one per five
+minutes), and a shell restart never re-announces an ongoing incident.
+Disable with the `notifyOnChange` setting.
 
 ## The honesty contract
 
@@ -67,6 +75,13 @@ Edits to the config apply live — the panel watches the file.
 | `format` | `number`, `percent`, `bytes`, `seconds`, `updown`. |
 | `labelKey` | Label naming each series (auto: `node` → `host` → `instance` → `job`). |
 | `unit`, `decimals` | Display suffix and precision for `number`. |
+| `history` | `false` to skip the sparkline range query for this check. |
+
+Global history tuning (optional, top-level): `"history": {"enabled": true,
+"spanSec": 10800, "points": 40}` — the sparkline is a range query over
+`spanSec`, folded across series in the check's worst direction (`min` per
+timestep for `<`/`<=` checks, `max` otherwise). History is decoration: a
+failed range query degrades to no sparkline, never to a failed check.
 
 ### Bar interactions
 

@@ -56,6 +56,7 @@ CONFIG_DEFAULTS = {
     "tailscale": {},
     "victoriametrics": {},
     "checks": [],
+    "history": {},
 }
 
 
@@ -218,6 +219,52 @@ def _ms(started):
     return round((time.monotonic() - started) * 1000)
 
 
+def query_range(base_url, query, span_sec, points, timeout):
+    """Returns (matrix_result, error). Matrix rows carry `values` pairs."""
+    now = int(time.time())
+    step = max(15, int(span_sec / max(2, points)))
+    url = base_url.rstrip("/") + "/api/v1/query_range?" + urllib.parse.urlencode(
+        {"query": query, "start": now - int(span_sec), "end": now,
+         "step": step})
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            body = resp.read(8 * 1024 * 1024)
+        doc = json.loads(body)
+    except Exception as exc:  # history is decoration; any failure degrades soft
+        return None, str(exc)[:200]
+    if doc.get("status") != "success":
+        return None, str(doc.get("error") or "range query failed")[:200]
+    data = doc.get("data") or {}
+    if data.get("resultType") != "matrix":
+        return None, "expected matrix"
+    return data.get("result") or [], None
+
+
+def aggregate_history(matrix, op_name, points):
+    """Folds a multi-series matrix into one worst-direction trace: min per
+    timestep for < / <= checks (a dip is the problem), max otherwise.
+    Timesteps are bucketed by timestamp so unaligned series still combine;
+    missing buckets stay None."""
+    use_min = op_name in ("<", "<=")
+    buckets = {}
+    for series in matrix or []:
+        for ts, raw in series.get("values") or []:
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if value != value:
+                continue
+            ts = int(ts)
+            if ts not in buckets:
+                buckets[ts] = value
+            else:
+                buckets[ts] = min(buckets[ts], value) if use_min \
+                    else max(buckets[ts], value)
+    trace = [buckets[ts] for ts in sorted(buckets)]
+    return trace[-points:] if points else trace
+
+
 LABEL_PREFERENCE = ("node", "host", "instance", "job")
 
 
@@ -299,7 +346,7 @@ def _trim(value, decimals):
     return text.rstrip("0").rstrip(".") if "." in text else text
 
 
-def collect_checks(vm_cfg, checks_cfg):
+def collect_checks(vm_cfg, checks_cfg, hist_cfg=None):
     vm = {"enabled": bool(vm_cfg.get("url")), "url": str(vm_cfg.get("url") or ""),
           "ok": False, "error": None, "latencyMs": None}
     checks = []
@@ -314,26 +361,38 @@ def collect_checks(vm_cfg, checks_cfg):
         return vm, checks
 
     timeout = _num(vm_cfg.get("timeoutSec"), 5)
+    hist_cfg = hist_cfg or {}
+    hist_enabled = hist_cfg.get("enabled", True)
+    hist_span = int(_num(hist_cfg.get("spanSec"), 10800))
+    hist_points = int(_num(hist_cfg.get("points"), 40))
 
     def run_one(check):
         query = str(check.get("query") or "")
         if not query:
-            return check, None, None, "check has no query"
-        return (check,) + query_instant(vm["url"], query, timeout)
+            return check, None, None, "check has no query", None
+        result, latency, error = query_instant(vm["url"], query, timeout)
+        history = None
+        if error is None and hist_enabled and check.get("history") is not False:
+            matrix, hist_err = query_range(vm["url"], query, hist_span,
+                                           hist_points, timeout)
+            if hist_err is None:
+                history = aggregate_history(matrix, str(check.get("op", ">=")),
+                                            hist_points)
+        return check, result, latency, error, history
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
         results = list(pool.map(run_one, checks_cfg))
 
     latencies = []
     any_reachable = False
-    for check, result, latency, error in results:
+    for check, result, latency, error, history in results:
         if latency is not None:
             latencies.append(latency)
         if error is None and result is not None:
             any_reachable = True
             series, severity, eval_error = evaluate_check(check, result)
             checks.append(_check_shell(check, severity, eval_error,
-                                       series=series))
+                                       series=series, history=history))
         else:
             checks.append(_check_shell(check, "unknown", error))
     vm["ok"] = any_reachable or not checks_cfg
@@ -344,13 +403,14 @@ def collect_checks(vm_cfg, checks_cfg):
     return vm, checks
 
 
-def _check_shell(check, severity, error, series=None):
+def _check_shell(check, severity, error, series=None, history=None):
     return {
         "id": str(check.get("id") or check.get("name") or "check"),
         "name": str(check.get("name") or check.get("id") or "Check"),
         "severity": severity,
         "error": error,
         "series": series or [],
+        "history": history or [],
         "op": str(check.get("op", ">=")),
         "warn": check.get("warn"),
         "crit": check.get("crit"),
@@ -367,7 +427,8 @@ def build_report(config_path):
     cfg, cfg_error = load_config(config_path)
     tailscale = collect_tailscale(cfg.get("tailscale") or {})
     vm, checks = collect_checks(cfg.get("victoriametrics") or {},
-                                cfg.get("checks") or [])
+                                cfg.get("checks") or [],
+                                cfg.get("history") or {})
 
     severities = [tailscale["severity"]]
     severities += [c["severity"] for c in checks]

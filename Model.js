@@ -59,6 +59,34 @@ function reportErrors(report) {
   return out;
 }
 
+// Compact description of everything currently wrong, for notifications:
+// failing check series first, then expected-but-offline nodes, then source
+// errors. Capped so a wide outage still fits a notification body.
+function issueSummary(report, maxLen) {
+  if (!report) return "";
+  var bits = [];
+  var checks = report.checks || [];
+  for (var i = 0; i < checks.length; i++) {
+    var c = checks[i];
+    if (c.severity === "ok") continue;
+    if (c.error) { bits.push(c.name + ": " + c.error); continue; }
+    var bad = [];
+    for (var j = 0; j < c.series.length; j++) {
+      if (c.series[j].severity !== "ok")
+        bad.push(c.series[j].label + " " + c.series[j].display);
+    }
+    if (bad.length > 0) bits.push(c.name + ": " + bad.join(", "));
+  }
+  var ts = report.tailscale;
+  if (ts && ts.offlineExpected && ts.offlineExpected.length > 0)
+    bits.push("offline: " + ts.offlineExpected.join(", "));
+  var errors = reportErrors(report);
+  for (var k = 0; k < errors.length; k++) bits.push(errors[k]);
+  var text = bits.join(" · ");
+  var cap = maxLen || 180;
+  return text.length > cap ? text.substring(0, cap - 1) + "…" : text;
+}
+
 function relTime(epochSeconds, nowMs) {
   if (!epochSeconds) return "never";
   var s = Math.max(0, Math.round(nowMs / 1000 - epochSeconds));
