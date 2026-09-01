@@ -150,6 +150,31 @@ function peerBadge(peer) {
   return peer.latencyMs + "ms" + path;
 }
 
+// Stable identity of everything currently wrong. The sentinel notifies when
+// this changes — so a NEW failure while severity is already warn/crit still
+// pings, instead of hiding behind the unchanged severity level.
+function issueFingerprint(report) {
+  if (!report) return "";
+  var keys = [];
+  var checks = report.checks || [];
+  for (var i = 0; i < checks.length; i++) {
+    var c = checks[i];
+    if (c.severity === "ok") continue;
+    var bad = [];
+    for (var j = 0; j < c.series.length; j++)
+      if (c.series[j].severity !== "ok")
+        bad.push(c.series[j].severity + ":" + c.series[j].label);
+    keys.push(c.id + "[" + (c.error ? "err" : bad.sort().join(",")) + "]");
+  }
+  var ts = report.tailscale;
+  if (ts && ts.offlineExpected && ts.offlineExpected.length > 0)
+    keys.push("offline[" + ts.offlineExpected.slice().sort().join(",") + "]");
+  var errors = reportErrors(report);
+  for (var k = 0; k < errors.length; k++)
+    keys.push("src[" + errors[k].split(":")[0] + "]");
+  return keys.sort().join("|");
+}
+
 function relTime(epochSeconds, nowMs) {
   if (!epochSeconds) return "never";
   var s = Math.max(0, Math.round(nowMs / 1000 - epochSeconds));

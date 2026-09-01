@@ -54,6 +54,7 @@ DEFAULT_CONFIG_PATH = os.path.expanduser("~/.config/fleetbar/config.json")
 CONFIG_DEFAULTS = {
     "fleetName": "Fleet",
     "dashboardUrl": "",
+    "sshCommand": "ssh {name}",
     "tailscale": {},
     "victoriametrics": {},
     "checks": [],
@@ -602,6 +603,7 @@ def build_report(config_path):
         "durationMs": _ms(started),
         "fleetName": str(cfg.get("fleetName") or "Fleet"),
         "dashboardUrl": str(cfg.get("dashboardUrl") or ""),
+        "sshCommand": str(cfg.get("sshCommand") or "ssh {name}"),
         "configPath": config_path,
         "configError": cfg_error,
         "tailscale": tailscale,

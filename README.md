@@ -19,8 +19,10 @@ check's history) and a worst-first headline, and an honest footer with
 data age and collection latency.
 
 **It's a sentinel, not just a dashboard**: when the fleet's overall severity
-changes, Fleetbar sends a desktop notification naming exactly what broke —
-`Busta Fleet: WARN — Disk used: omarchy 45.3%` — and one when it recovers.
+changes — or when the *set of offenders* changes at the same severity, so a
+second machine failing during an existing warning still pings — Fleetbar
+sends a desktop notification naming exactly what broke, and one when it
+recovers.
 Notifications are transition-based and flap-guarded (at most one per five
 minutes), and a shell restart never re-announces an ongoing incident.
 Disable with the `notifyOnChange` setting.
@@ -113,13 +115,21 @@ Global history tuning (optional, top-level): `"history": {"enabled": true,
 timestep for `<`/`<=` checks, `max` otherwise). History is decoration: a
 failed range query degrades to no sparkline, never to a failed check.
 
-### Bar interactions
+### Interactions
 
-| Action | Effect |
+| Bar | Effect |
 |---|---|
 | Click | Toggle the fleet panel |
 | Middle click | Force refresh |
 | Right click | Open your `dashboardUrl` |
+
+The panel is keyboard-first, like the rest of Omarchy: `j`/`k` (or arrows)
+move the cursor through the node rows, `Enter`/`s` opens your default
+terminal SSH'd to the selected node, `c` copies its IP, `r` refreshes,
+`g` opens the dashboard, `Esc` closes. Each online node also has SSH and
+copy buttons. The SSH command is a config template — `"sshCommand":
+"ssh {name}"` by default, with `{name}`/`{ip}`/`{host}` placeholders
+(split on whitespace; no quoting).
 
 IPC: `qs ipc call stratoforce.fleetbar toggle` (also `open`, `close`, `refresh`).
 

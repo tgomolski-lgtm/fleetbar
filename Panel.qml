@@ -125,20 +125,59 @@ Panel {
     if (peer && peer.ip) Quickshell.execDetached(["wl-copy", String(peer.ip)])
   }
 
+  // Opens the user's default terminal already connected to the node. The
+  // command template comes from the fleet config; naive whitespace split is
+  // documented — quoting inside the template is not supported.
+  function sshInto(peer) {
+    if (!peer || !peer.online || peer.self) return
+    var template = (report && report.sshCommand) ? report.sshCommand : "ssh {name}"
+    var cmd = template.replace("{name}", peer.name)
+      .replace("{ip}", peer.ip).replace("{host}", peer.host)
+    var parts = cmd.split(" ").filter(function(p) { return p !== "" })
+    if (parts.length > 0)
+      Quickshell.execDetached(["omarchy-launch-terminal"].concat(parts))
+  }
+
+  // ---- Keyboard cursor over the node rows (Omarchy is keyboard-first) ----
+
+  property int cursorIndex: -1
+
+  function moveCursor(delta) {
+    if (peers.length === 0) return
+    if (cursorIndex < 0) cursorIndex = delta > 0 ? 0 : peers.length - 1
+    else cursorIndex = Math.max(0, Math.min(peers.length - 1, cursorIndex + delta))
+  }
+
+  function cursorPeer() {
+    return (cursorIndex >= 0 && cursorIndex < peers.length) ? peers[cursorIndex] : null
+  }
+
   // ---- Sentinel: desktop notification on severity transitions ------------
 
   // "" = no report seen yet: the first report sets the baseline silently, so
   // a shell restart during an ongoing incident doesn't re-announce it.
   property string lastNotifiedSeverity: ""
+  property string lastFingerprint: ""
+  property bool baselineSet: false
   property double lastNotifyMs: 0
 
   function maybeNotify() {
     if (!summary) return
     var sev = summary.severity
-    if (lastNotifiedSeverity === "") { lastNotifiedSeverity = sev; return }
-    if (sev === lastNotifiedSeverity) return
+    var fingerprint = Model.issueFingerprint(report)
+    if (!baselineSet) {
+      baselineSet = true
+      lastNotifiedSeverity = sev
+      lastFingerprint = fingerprint
+      return
+    }
+    // Notify on a severity change OR on a different set of offenders at the
+    // same severity — studio2 going down while disk already warns still
+    // deserves a ping.
+    if (sev === lastNotifiedSeverity && fingerprint === lastFingerprint) return
     var previous = lastNotifiedSeverity
     lastNotifiedSeverity = sev
+    lastFingerprint = fingerprint
     if (!notifyOnChange) return
     // Flap guard: state always tracks truth above, but at most one ping per
     // five minutes — a bouncing check can't spam the desktop.
@@ -160,6 +199,7 @@ Panel {
 
   function open() {
     openedFromHotkey = false
+    cursorIndex = -1
     setCenterHoverRevealSuppressed(false)
     root.controller.show()
     root.refresh()
@@ -167,6 +207,7 @@ Panel {
 
   function openFromHotkey() {
     openedFromHotkey = true
+    cursorIndex = -1
     root.controller.show()
     root.refresh()
     Qt.callLater(function() {
@@ -281,6 +322,17 @@ Panel {
       anchors.fill: parent
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
+      onMoveRequested: function(dx, dy) { if (dy !== 0) root.moveCursor(dy) }
+      onActivateRequested: root.sshInto(root.cursorPeer())
+      onReturnRequested: root.sshInto(root.cursorPeer())
+      onTextKey: function(t) {
+        if (t === "j") root.moveCursor(1)
+        else if (t === "k") root.moveCursor(-1)
+        else if (t === "c") root.copyPeerIp(root.cursorPeer())
+        else if (t === "s") root.sshInto(root.cursorPeer())
+        else if (t === "r") root.refresh()
+        else if (t === "g") root.openDashboard()
+      }
 
       Flickable {
         id: fleetScroll
@@ -463,6 +515,7 @@ Panel {
               CursorSurface {
                 id: nodeRow
                 required property var modelData
+                required property int index
                 readonly property string state: Model.peerState(modelData)
                 readonly property color dotColor: state === "online" ? Color.accent
                   : state === "offline-expected" ? Color.urgent : root.dim
@@ -471,7 +524,7 @@ Panel {
                 implicitHeight: nodeInner.implicitHeight + Style.spacing.xl
                 radius: Style.cornerRadius
                 foreground: root.panelFg
-                hasCursor: nodeMouse.containsMouse
+                hasCursor: nodeMouse.containsMouse || root.cursorIndex === index
 
                 MouseArea {
                   id: nodeMouse
@@ -557,6 +610,16 @@ Panel {
                     font.family: root.bar ? root.bar.fontFamily : Style.font.family
                     font.pixelSize: Style.font.caption
                     Layout.alignment: Qt.AlignVCenter
+                  }
+
+                  PanelActionButton {
+                    visible: nodeRow.modelData.online && !nodeRow.modelData.self
+                    iconText: ""
+                    tooltipText: "SSH to " + nodeRow.modelData.name
+                    foreground: root.panelFg
+                    fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+                    Layout.alignment: Qt.AlignVCenter
+                    onClicked: root.sshInto(nodeRow.modelData)
                   }
 
                   PanelActionButton {
@@ -732,6 +795,14 @@ Panel {
               return bits.join(" · ")
             }
             color: root.stale ? Color.urgent : root.dim
+            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.pixelSize: Style.font.caption
+          }
+
+          Text {
+            width: parent.width
+            text: "j/k move  \u23ce ssh  c copy ip  r refresh  g dashboard"
+            color: root.tinted(root.dim, 0.75)
             font.family: root.bar ? root.bar.fontFamily : Style.font.family
             font.pixelSize: Style.font.caption
           }

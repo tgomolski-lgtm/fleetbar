@@ -11,7 +11,7 @@ const source = readFileSync(join(here, "..", "Model.js"), "utf8")
   .replace(/^\.pragma library$/m, "");
 const Model = new Function(`${source};
   return { severityRank, worstSeverity, barLabel, summaryLine, reportErrors,
-           relTime, osIcon, peerState, isStale, issueSummary, checkHeadline, checkDetail, peerDetail, peerBadge };`)();
+           relTime, osIcon, peerState, isStale, issueSummary, checkHeadline, checkDetail, peerDetail, peerBadge, issueFingerprint };`)();
 
 let passed = 0;
 function test(name, fn) {
@@ -159,6 +159,24 @@ test("peerBadge: latency chip only for measured remote peers", () => {
   assert.equal(Model.peerBadge({ online: true, self: false, latencyMs: null, path: null }), "");
   assert.equal(Model.peerBadge({ online: true, self: true, latencyMs: 1 }), "");
   assert.equal(Model.peerBadge({ online: false, self: false, latencyMs: 1 }), "");
+});
+
+
+test("issueFingerprint changes when offenders change, stable otherwise", () => {
+  const rep = (badLabel) => ({
+    checks: [{ id: "gw", severity: "crit", error: null, series: [
+      { label: badLabel, severity: "crit", display: "DOWN" },
+      { label: "ok1", severity: "ok", display: "up" }] }],
+    tailscale: { enabled: true, ok: true, error: null, offlineExpected: ["nas"] },
+    vm: { enabled: true, ok: true, error: null }, configError: null,
+  });
+  assert.equal(Model.issueFingerprint(rep("s2")), Model.issueFingerprint(rep("s2")));
+  assert.notEqual(Model.issueFingerprint(rep("s2")), Model.issueFingerprint(rep("s3")));
+  const healthy = { checks: [{ id: "gw", severity: "ok", error: null, series: [] }],
+    tailscale: { enabled: true, ok: true, error: null, offlineExpected: [] },
+    vm: { enabled: true, ok: true, error: null }, configError: null };
+  assert.equal(Model.issueFingerprint(healthy), "");
+  assert.equal(Model.issueFingerprint(null), "");
 });
 
 console.log(`\n${passed} tests passed`);
