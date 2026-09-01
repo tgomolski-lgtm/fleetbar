@@ -1,0 +1,34 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Both suites are fully offline: sources are mocked, no tailscale or
+      # metrics endpoint is contacted.
+      - name: Collector tests (Python, stdlib only)
+        run: python3 tests/test_collector.py
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Model tests (Node)
+        run: node tests/run-model-tests.mjs
+
+      - name: Manifest is valid JSON with required fields
+        run: |
+          python3 - <<'EOF'
+          import json
+          m = json.load(open("manifest.json"))
+          for key in ("schemaVersion", "id", "name", "version", "kinds", "entryPoints"):
+              assert key in m, f"manifest missing {key}"
+          assert m["entryPoints"]["barWidget"] == "BarWidget.qml"
+          print("manifest ok:", m["id"], m["version"])
+          EOF
