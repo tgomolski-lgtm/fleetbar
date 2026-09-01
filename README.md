@@ -36,7 +36,7 @@ collector treats failure as data:
 ## Install
 
 ```
-omarchy plugin add https://github.com/YOURUSER/fleetbar --enable
+omarchy plugin add https://github.com/tgomolski-lgtm/fleetbar --enable
 ```
 
 Then describe your fleet in `~/.config/fleetbar/config.json` (start from
