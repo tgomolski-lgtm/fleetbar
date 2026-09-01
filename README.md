@@ -10,10 +10,13 @@ metrics source (VictoriaMetrics, Prometheus, Thanos, Mimir, ...).
 ![Fleetbar panel](preview.png)
 
 The bar shows `7/8` (nodes online) and appends `!N` when anything needs
-attention. Click for the full panel: node chips with online state, OS and
-click-to-copy IPs, every check with its per-series values and a **sparkline
-trend** (worst-direction fold of the check's history), and an honest footer
-with data age and collection latency.
+attention. Click for the full panel: two-line machine rows — name over
+`IP · chip · cores · RAM`, live **latency** per node (`1ms`, or
+`23ms · via mia` when traffic falls back to a relay — the anomaly worth
+noticing), **last seen** age for offline machines, click-to-copy IPs —
+plus every check with a **sparkline trend** (worst-direction fold of the
+check's history) and a worst-first headline, and an honest footer with
+data age and collection latency.
 
 **It's a sentinel, not just a dashboard**: when the fleet's overall severity
 changes, Fleetbar sends a desktop notification naming exactly what broke —
@@ -136,8 +139,8 @@ IPC: `qs ipc call stratoforce.fleetbar toggle` (also `open`, `close`, `refresh`)
 ## Tests
 
 ```
-python3 tests/test_collector.py   # 28 tests: sources, severity, formats, failure paths
-node tests/run-model-tests.mjs    # 9 tests: pure view-model helpers
+python3 tests/test_collector.py   # 32 tests: sources, severity, formats, failure paths
+node tests/run-model-tests.mjs    # 13 tests: pure view-model helpers
 ```
 
 ## License
