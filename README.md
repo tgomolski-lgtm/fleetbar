@@ -7,8 +7,6 @@ on your **Tailscale** tailnet (straight from the local daemon — no API key, no
 cloud), and any number of threshold **checks** against a Prometheus-compatible
 metrics source (VictoriaMetrics, Prometheus, Thanos, Mimir, ...).
 
-![Fleetbar panel](preview.png)
-
 The bar shows `7/8` (nodes online) and appends `!N` when anything needs
 attention. Click for the full panel: two-line machine rows — name over
 `IP · chip · cores · RAM`, live **latency** per node (`1ms`, or
