@@ -39,6 +39,12 @@ collector treats failure as data:
 omarchy plugin add https://github.com/tgomolski-lgtm/fleetbar --enable
 ```
 
+Dependencies: `python3` (stdlib only) and, for the node list, the `tailscale`
+CLI — without it, node status degrades to an explicit "not installed" state
+and metric checks still work. Remove with `omarchy plugin remove
+stratoforce.fleetbar`; this deletes the plugin folder only and leaves your
+`~/.config/fleetbar/config.json` (which Fleetbar reads but never writes).
+
 Then describe your fleet in `~/.config/fleetbar/config.json` (start from
 [config.example.json](config.example.json)):
 
