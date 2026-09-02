@@ -36,17 +36,19 @@ TS_FIXTURE = {
 }
 
 
-def ts_proc(payload, returncode=0, stderr=""):
+def ts_proc(payload, returncode=0, stderr="", overflow=False, timed_out=False):
     proc = mock.Mock()
     proc.returncode = returncode
     proc.stdout = json.dumps(payload) if isinstance(payload, dict) else payload
     proc.stderr = stderr
+    proc.overflow = overflow
+    proc.timed_out = timed_out
     return proc
 
 
 class TailscaleTests(unittest.TestCase):
     def collect(self, cfg, payload=TS_FIXTURE, **kwargs):
-        with mock.patch.object(collector.subprocess, "run",
+        with mock.patch.object(collector, "_run_bounded",
                                return_value=ts_proc(payload, **kwargs)):
             return collector.collect_tailscale(cfg)
 
@@ -367,7 +369,7 @@ class HardeningTests(unittest.TestCase):
                             "TailscaleIPs": ["not-an-ip", "999.1.1.1",
                                              "100.1.2.3", "fd7a::1"],
                             "OS": "linux", "Online": True}}
-        with mock.patch.object(collector.subprocess, "run",
+        with mock.patch.object(collector, "_run_bounded",
                                return_value=ts_proc(payload)):
             out = collector.collect_tailscale({})
         peer = out["peers"][0]
@@ -380,7 +382,7 @@ class HardeningTests(unittest.TestCase):
                    "Peer": {str(i): {"HostName": "p%d" % i, "Online": True,
                                      "TailscaleIPs": [], "OS": "linux"}
                             for i in range(collector.MAX_PEERS + 50)}}
-        with mock.patch.object(collector.subprocess, "run",
+        with mock.patch.object(collector, "_run_bounded",
                                return_value=ts_proc(payload)):
             out = collector.collect_tailscale({"latency": False})
         self.assertLessEqual(out["total"], collector.MAX_PEERS + 1)
@@ -430,6 +432,165 @@ class VmErrorTests(unittest.TestCase):
             {}, [{"id": "a", "name": "A", "query": "up"}])
         self.assertFalse(vm["ok"])
         self.assertEqual(checks[0]["severity"], "unknown")
+
+
+class Round3HardeningTests(unittest.TestCase):
+    """Reviewer blockers (marketplace #4031, round 3): config no-follow /
+    type / owner / pre-read size, producer-side child caps, cap+1 HTTP
+    rejection with a wall-clock deadline, bounded report, tree cleanup."""
+
+    def test_config_symlink_is_refused(self):
+        import tempfile, pathlib
+        with tempfile.TemporaryDirectory() as d:
+            real = pathlib.Path(d, "real.json"); real.write_text("{}")
+            link = pathlib.Path(d, "link.json"); link.symlink_to(real)
+            cfg, err = collector.load_config(str(link))
+            self.assertIn("symlink", err)
+            self.assertEqual(cfg["fleetName"], "Fleet")
+
+    def test_config_over_cap_is_refused_before_read(self):
+        import tempfile, pathlib
+        with tempfile.TemporaryDirectory() as d:
+            big = pathlib.Path(d, "big.json")
+            big.write_text('{"fleetName": "' + "x" * (collector.MAX_CONFIG_BYTES + 10) + '"}')
+            cfg, err = collector.load_config(str(big))
+            self.assertIn("exceeds", err)
+            self.assertEqual(cfg["fleetName"], "Fleet")
+
+    def test_config_not_regular_file_is_refused(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            cfg, err = collector.load_config(d)
+            self.assertIn("unreadable", err)
+
+    def test_config_wrong_owner_is_refused(self):
+        import tempfile, pathlib, os as _os
+        with tempfile.TemporaryDirectory() as d:
+            f = pathlib.Path(d, "c.json"); f.write_text("{}")
+            real = _os.fstat
+            def fake(fd):
+                st = real(fd)
+                return _os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink,
+                                        st.st_uid + 1, st.st_gid, st.st_size,
+                                        st.st_atime, st.st_mtime, st.st_ctime))
+            with mock.patch.object(collector.os, "fstat", fake):
+                cfg, err = collector.load_config(str(f))
+            self.assertIn("owned", err)
+
+    def test_child_stdout_over_cap_is_rejected_not_truncated(self):
+        res = collector._run_bounded(
+            [sys.executable, "-c", "import sys; sys.stdout.write('x' * 200000)"],
+            5, 1000)
+        self.assertTrue(res.overflow)
+        self.assertEqual(res.stdout, "")
+
+    def test_child_stderr_over_cap_is_rejected(self):
+        res = collector._run_bounded(
+            [sys.executable, "-c", "import sys; sys.stderr.write('e' * 5000)"],
+            5, 100000, max_err=100)
+        self.assertTrue(res.overflow)
+
+    def test_child_deadline_kills_process_group(self):
+        import time as _t
+        started = _t.monotonic()
+        res = collector._run_bounded(
+            [sys.executable, "-c",
+             "import subprocess, time; subprocess.Popen(['sleep', '30']); time.sleep(30)"],
+            0.5, 1000)
+        self.assertTrue(res.timed_out)
+        self.assertLess(_t.monotonic() - started, 5)
+        # the grandchild `sleep 30` was in the same session; it must be gone
+        _t.sleep(0.3)
+        import subprocess as _sp
+        out = _sp.run(["pgrep", "-f", "^sleep 30$"], capture_output=True, text=True).stdout
+        self.assertEqual(out.strip(), "")
+
+    def test_child_clean_run_returns_output(self):
+        res = collector._run_bounded([sys.executable, "-c", "print('ok')"], 5, 1000)
+        self.assertFalse(res.overflow or res.timed_out)
+        self.assertEqual(res.stdout.strip(), "ok")
+        self.assertEqual(res.returncode, 0)
+
+    def test_tailscale_overflow_is_unknown_with_reason(self):
+        out = self.collect_ts({}, overflow=True)
+        self.assertEqual(out["severity"], "unknown")
+        self.assertIn("exceeds", out["error"])
+
+    def collect_ts(self, cfg, **kw):
+        with mock.patch.object(collector, "_run_bounded",
+                               return_value=ts_proc(TS_FIXTURE, **kw)):
+            return collector.collect_tailscale(cfg)
+
+    class _Resp:
+        def __init__(self, chunks, length=None, delay=0):
+            self.chunks = list(chunks); self.headers = {}
+            if length is not None: self.headers["Content-Length"] = str(length)
+            self.delay = delay
+        def read(self, n):
+            import time as _t
+            if self.delay: _t.sleep(self.delay)
+            return self.chunks.pop(0) if self.chunks else b""
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    def test_http_body_over_cap_is_rejected(self):
+        resp = self._Resp([b"x" * 70000, b"y" * 70000, b""])
+        with mock.patch.object(collector._OPENER, "open", return_value=resp):
+            body, err = collector._http_get("http://h/x", 5, 100000)
+        self.assertIsNone(body)
+        self.assertIn("exceeds", err)
+
+    def test_http_declared_length_over_cap_is_refused_unread(self):
+        resp = self._Resp([b"{}"], length=10 ** 9)
+        with mock.patch.object(collector._OPENER, "open", return_value=resp):
+            body, err = collector._http_get("http://h/x", 5, 1000)
+        self.assertIsNone(body)
+        self.assertIn("declares", err)
+        self.assertEqual(len(resp.chunks), 1)  # never read
+
+    def test_http_wall_clock_deadline(self):
+        resp = self._Resp([b"a"] * 50, delay=0.05)
+        with mock.patch.object(collector._OPENER, "open", return_value=resp):
+            body, err = collector._http_get("http://h/x", 0.2, 10 ** 6)
+        self.assertIsNone(body)
+        self.assertIn("deadline", err)
+
+    def test_http_within_cap_ok(self):
+        resp = self._Resp([b'{"status":"success"}', b""])
+        with mock.patch.object(collector._OPENER, "open", return_value=resp):
+            body, err = collector._http_get("http://h/x", 5, 1000)
+        self.assertIsNone(err)
+        self.assertEqual(body, b'{"status":"success"}')
+
+    def test_bound_caps_strings_lists_keys_depth_and_nan(self):
+        deep = {"a": "x" * 10000, "l": list(range(5000)),
+                "n": float("nan"), "k%d" % 0: 1}
+        for i in range(200): deep["key%d" % i] = i
+        nest = deep
+        for _ in range(20): nest = {"d": nest}
+        b = collector._bound(nest)
+        cur = b; depth = 0
+        while isinstance(cur, dict) and "d" in cur: cur = cur["d"]; depth += 1
+        self.assertLessEqual(depth, collector.MAX_DEPTH + 1)
+        flat = collector._bound(deep)
+        self.assertEqual(len(flat["a"]), collector.MAX_STR)
+        self.assertEqual(len(flat["l"]), collector.MAX_LIST)
+        self.assertIsNone(flat["n"])
+        self.assertLessEqual(len(flat), collector.MAX_KEYS)
+
+    def test_report_is_bounded_end_to_end(self):
+        huge = json.loads(json.dumps(TS_FIXTURE))
+        huge["Peer"]["k1"]["HostName"] = "h" * 5000
+        with mock.patch.object(collector, "_run_bounded", return_value=ts_proc(huge)), \
+             mock.patch.object(collector, "load_config",
+                               return_value=({"fleetName": "F" * 500, "tailscale": {},
+                                              "victoriametrics": {}, "checks": [],
+                                              "history": {}, "nodeInfo": {}, "nodeStats": {},
+                                              "dashboardUrl": "", "sshCommand": "ssh {name}"}, None)):
+            rep = collector.build_report("/nonexistent")
+        self.assertLessEqual(len(rep["fleetName"]), 64)
+        self.assertTrue(all(len(p["name"]) <= collector.MAX_STR for p in rep["tailscale"]["peers"]))
+        json.dumps(rep)  # serializable (no NaN)
 
 
 if __name__ == "__main__":

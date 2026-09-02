@@ -240,13 +240,36 @@ Panel {
 
   // ---- Processes / timers ----------------------------------------------
 
+  // Producer-side caps on both child streams, enforced *before* anything is
+  // buffered on the QML side: stdout passes through `head -c cap+1` (so an
+  // over-cap document arrives as cap+1 bytes and is rejected below, never
+  // accepted as a prefix) and stderr through a 64 KiB head. `set -m` puts
+  // the pipeline in its own process group; the TERM trap kills that whole
+  // group, so stopping this Process (watchdog or shutdown) takes the python
+  // collector and every helper it spawned down with it.
+  readonly property int maxReportBytes: 2 * 1024 * 1024
+  readonly property string collectorWrapper:
+    'set -m\n' +
+    'python3 "$0" 2> >(head -c 65536 >&2) | head -c ' + (maxReportBytes + 1) + ' &\n' +
+    'pg=$(jobs -p | head -n 1)\n' +
+    'trap \'[ -n "$pg" ] && kill -TERM -- -"$pg" 2>/dev/null; exit 124\' TERM INT HUP\n' +
+    'wait %1\n' +
+    'rc=$?\n' +
+    '[ -n "$pg" ] && kill -TERM -- -"$pg" 2>/dev/null\n' +
+    'exit $rc\n'
+
   Process {
     id: collectorProc
-    command: ["python3", root.collectorPath]
+    command: ["bash", "-c", root.collectorWrapper, root.collectorPath]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        var raw = String(text || "").trim()
+        var raw = String(text || "")
+        if (raw.length > root.maxReportBytes) {
+          root.collectorError = "collector output exceeds " + root.maxReportBytes + " bytes; rejected"
+          return
+        }
+        raw = raw.trim()
         if (raw === "") {
           root.collectorError = "collector produced no output"
           return
@@ -272,6 +295,9 @@ Panel {
   // Watchdog: the collector bounds every source with its own timeout, but a
   // wedged python process would otherwise hold `running` forever and block
   // all future refreshes. 60s is several times the worst honest run.
+  // Stopping the Process sends TERM to the bash wrapper, whose trap kills the
+  // pipeline's process group (see collectorWrapper); the python side also
+  // kills its own child groups on TERM. Nothing is left to orphan.
   Timer {
     interval: 60000
     running: collectorProc.running
@@ -377,6 +403,7 @@ Panel {
               spacing: Style.space(14)
 
               Text {
+                textFormat: Text.PlainText
                 id: heroGlyph
                 text: root.barGlyph
                 color: root.severityColor(root.severity, root.panelFg)
@@ -401,6 +428,7 @@ Panel {
                 spacing: 0
 
                 Text {
+                  textFormat: Text.PlainText
                   text: root.summary && root.summary.peersTotal > 0
                     ? root.summary.peersOnline + "/" + root.summary.peersTotal : "—"
                   color: root.panelFg
@@ -410,6 +438,7 @@ Panel {
                 }
 
                 Text {
+                  textFormat: Text.PlainText
                   text: "NODES ONLINE"
                   color: root.dim
                   font.family: root.bar ? root.bar.fontFamily : Style.font.family
@@ -424,6 +453,7 @@ Panel {
                 spacing: 0
 
                 Text {
+                  textFormat: Text.PlainText
                   text: root.summary ? "!" + root.summary.issues : ""
                   color: root.severityColor(root.severity, root.panelFg)
                   font.family: root.bar ? root.bar.fontFamily : Style.font.family
@@ -432,6 +462,7 @@ Panel {
                 }
 
                 Text {
+                  textFormat: Text.PlainText
                   text: root.summary && root.summary.issues === 1 ? "ISSUE" : "ISSUES"
                   color: root.dim
                   font.family: root.bar ? root.bar.fontFamily : Style.font.family
@@ -449,6 +480,7 @@ Panel {
               spacing: Style.space(6)
 
               Text {
+                textFormat: Text.PlainText
                 text: root.fleetName.toUpperCase()
                 color: root.dim
                 font.family: root.bar ? root.bar.fontFamily : Style.font.family
@@ -502,6 +534,7 @@ Panel {
                   .concat(root.reportErrors)
 
                 Text {
+                  textFormat: Text.PlainText
                   required property var modelData
                   text: modelData
                   color: Color.urgent
@@ -583,6 +616,7 @@ Panel {
                   }
 
                   Text {
+                    textFormat: Text.PlainText
                     text: Model.osIcon(nodeRow.modelData.os)
                     color: root.dim
                     font.family: root.bar ? root.bar.fontFamily : Style.font.family
@@ -839,6 +873,7 @@ Panel {
 
           // ---- Footer: freshness + collection cost, honestly stated.
           Text {
+            textFormat: Text.PlainText
             width: parent.width
             text: {
               if (!root.report) return root.collectorError !== ""
@@ -856,6 +891,7 @@ Panel {
           }
 
           Text {
+            textFormat: Text.PlainText
             width: parent.width
             text: "j/k move  \u23ce ssh  c copy ip  r refresh  g dashboard"
             color: root.tinted(root.dim, 0.75)

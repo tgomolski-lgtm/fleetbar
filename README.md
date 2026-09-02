@@ -43,6 +43,32 @@ redirects; SSH substitutions accept only host-shaped values (a peer named
 like an ssh option is refused, never passed); dashboard clicks open only
 http(s) URLs; and a QML watchdog kills a wedged collector after 60s.
 
+## Bounds and process hygiene
+
+Everything the collector reads is producer-controlled, so nothing is trusted
+for size, shape, or lifetime:
+
+- **Config**: opened with `O_NOFOLLOW`; must be a regular file owned by the
+  running user; refused if `fstat` reports more than 256 KiB *before* a byte
+  is read, and the read itself stops one byte past the cap and rejects.
+- **Child processes** (`tailscale status`, `tailscale ping`): run in their
+  own session; stdout/stderr are read incrementally with hard byte caps and
+  the whole group is killed on overflow, on the wall-clock deadline, or when
+  the collector itself receives TERM. Overflow is a rejection, never a
+  truncated prefix.
+- **HTTP**: http(s) only, redirects refused; a declared `Content-Length`
+  over the cap is refused unread; the body is chunk-read and rejected the
+  moment it passes cap+1; a wall-clock deadline bounds the transaction, not
+  just each socket operation.
+- **Report**: a final pass caps every string, every array, every object,
+  and nesting depth, and drops non-finite numbers, so the JSON handed to QML
+  has a known ceiling whatever produced it.
+- **QML side**: the collector runs under a `bash` wrapper that pipes stdout
+  through `head -c cap+1` and stderr through a 64 KiB `head` *before*
+  Quickshell buffers anything; the wrapper owns the pipeline's process group
+  and its TERM trap kills the group, so the 60 s watchdog (or shell exit)
+  takes the whole tree down. Every `Text` renders `Text.PlainText`.
+
 ## Install
 
 ```
@@ -170,7 +196,7 @@ IPC: `qs ipc call stratoforce.fleetbar toggle` (also `open`, `close`, `refresh`)
 ## Tests
 
 ```
-python3 tests/test_collector.py   # 40 tests: sources, severity, formats, failure and hardening paths
+python3 tests/test_collector.py   # 56 tests: sources, severity, formats, failure, bounds and process-hygiene paths
 node tests/run-model-tests.mjs    # 16 tests: pure view-model helpers
 ```
 

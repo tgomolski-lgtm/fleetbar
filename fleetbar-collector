@@ -22,11 +22,17 @@ Design contract with the QML side:
 import argparse
 import concurrent.futures
 import datetime
+import errno
 import json
+import math
 import os
 import re
+import selectors
+import signal
+import stat
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -44,6 +50,15 @@ MAX_SERIES = 64
 MAX_HISTORY_POINTS = 120
 MAX_STAT_ROWS = 256
 MAX_ALIASES = 256
+MAX_LIST = 256          # any array in the report
+MAX_KEYS = 64           # any object in the report
+MAX_DEPTH = 8           # report nesting
+MAX_CONFIG_BYTES = 256 * 1024
+MAX_CHILD_BYTES = 4 * 1024 * 1024   # tailscale status --json
+MAX_PING_BYTES = 64 * 1024
+MAX_ERR_BYTES = 64 * 1024
+MAX_HTTP_BYTES = 4 * 1024 * 1024
+MAX_RANGE_BYTES = 8 * 1024 * 1024
 def _valid_ipv4(value):
     parts = str(value).split(".")
     return len(parts) == 4 and all(
@@ -85,23 +100,154 @@ CONFIG_DEFAULTS = {
 }
 
 
+def _read_config_bytes(path):
+    """Open without following symlinks, insist on a regular file owned by the
+    running user, and refuse anything over MAX_CONFIG_BYTES *before* reading a
+    byte. The read itself stops one byte past the cap and rejects, so a file
+    that grows between fstat and read cannot slip through as a prefix."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError("config is not a regular file")
+        if st.st_uid != os.getuid():
+            raise OSError("config is not owned by the current user")
+        if st.st_size > MAX_CONFIG_BYTES:
+            raise OSError("config exceeds %d bytes" % MAX_CONFIG_BYTES)
+        buf = bytearray()
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                return bytes(buf)
+            buf += chunk
+            if len(buf) > MAX_CONFIG_BYTES:
+                raise OSError("config exceeds %d bytes" % MAX_CONFIG_BYTES)
+    finally:
+        os.close(fd)
+
+
 def load_config(path):
     """Returns (config_dict, error_string_or_None). A missing or broken file
     still yields a usable config (defaults) so the report explains itself."""
     cfg = json.loads(json.dumps(CONFIG_DEFAULTS))  # deep copy
     try:
-        with open(path, "r", encoding="utf-8") as fh:
-            user = json.load(fh)
+        user = json.loads(_read_config_bytes(path).decode("utf-8"))
     except FileNotFoundError:
         return cfg, "config not found: %s" % path
-    except (OSError, json.JSONDecodeError) as exc:
-        return cfg, "config unreadable: %s" % exc
+    except OSError as exc:
+        if getattr(exc, "errno", None) == errno.ELOOP:
+            return cfg, "config must not be a symlink: %s" % path
+        return cfg, _s("config unreadable: %s" % exc)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return cfg, _s("config unreadable: %s" % exc)
     if not isinstance(user, dict):
         return cfg, "config root must be a JSON object"
     for key in cfg:
         if key in user:
             cfg[key] = user[key]
     return cfg, None
+
+
+# ---------------------------------------------------------------------------
+# Child processes: every stream is capped on the producer side, the timeout
+# is a total deadline, and the child runs in its own process group so the
+# whole tree goes away on overflow, timeout, or our own SIGTERM.
+
+_LIVE_GROUPS = set()
+_LIVE_LOCK = threading.Lock()
+
+
+def _kill_group(proc):
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(proc.pid, sig)
+        except ProcessLookupError:
+            break
+        except OSError:
+            break
+        try:
+            proc.wait(timeout=1)
+            break
+        except subprocess.TimeoutExpired:
+            continue
+    try:
+        proc.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _on_terminate(signum, frame):
+    with _LIVE_LOCK:
+        groups = list(_LIVE_GROUPS)
+    for proc in groups:
+        _kill_group(proc)
+    os._exit(128 + signum)
+
+
+class _ChildResult:
+    __slots__ = ("returncode", "stdout", "stderr", "overflow", "timed_out")
+
+    def __init__(self):
+        self.returncode = None
+        self.stdout = ""
+        self.stderr = ""
+        self.overflow = False
+        self.timed_out = False
+
+
+def _run_bounded(cmd, timeout, max_out, max_err=MAX_ERR_BYTES):
+    """Run `cmd` in a new session. stdout/stderr are read incrementally; the
+    moment either exceeds its cap the child group is killed and the result is
+    flagged `overflow` (never a truncated prefix). `timeout` is wall-clock
+    for the entire run. Raises FileNotFoundError if the binary is missing."""
+    res = _ChildResult()
+    deadline = time.monotonic() + timeout
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, start_new_session=True)
+    with _LIVE_LOCK:
+        _LIVE_GROUPS.add(proc)
+    bufs = {"out": bytearray(), "err": bytearray()}
+    caps = {"out": max_out, "err": max_err}
+    sel = selectors.DefaultSelector()
+    sel.register(proc.stdout, selectors.EVENT_READ, "out")
+    sel.register(proc.stderr, selectors.EVENT_READ, "err")
+    open_streams = 2
+    try:
+        while open_streams and not res.overflow:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                res.timed_out = True
+                break
+            for key, _ in sel.select(timeout=remaining):
+                chunk = os.read(key.fileobj.fileno(), 65536)
+                if not chunk:
+                    sel.unregister(key.fileobj)
+                    open_streams -= 1
+                    continue
+                buf = bufs[key.data]
+                buf += chunk
+                if len(buf) > caps[key.data]:
+                    res.overflow = True
+                    break
+        if res.overflow or res.timed_out:
+            _kill_group(proc)
+        else:
+            try:
+                proc.wait(timeout=max(0.05, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                res.timed_out = True
+                _kill_group(proc)
+    finally:
+        sel.close()
+        proc.stdout.close()
+        proc.stderr.close()
+        with _LIVE_LOCK:
+            _LIVE_GROUPS.discard(proc)
+    res.returncode = proc.returncode
+    if not (res.overflow or res.timed_out):
+        res.stdout = bufs["out"].decode("utf-8", "replace")
+        res.stderr = bufs["err"].decode("utf-8", "replace")
+    return res
 
 
 # ---------------------------------------------------------------------------
@@ -115,26 +261,35 @@ def collect_tailscale(ts_cfg):
         out["ok"] = True
         return out
 
-    timeout = _num(ts_cfg.get("timeoutSec"), 5)
+    timeout = min(60, _num(ts_cfg.get("timeoutSec"), 5))
     try:
-        proc = subprocess.run(["tailscale", "status", "--json"],
-                              capture_output=True, text=True, timeout=timeout)
+        proc = _run_bounded(["tailscale", "status", "--json"], timeout,
+                            MAX_CHILD_BYTES)
     except FileNotFoundError:
         out["error"] = "tailscale CLI not installed"
         out["severity"] = "unknown"
         return out
-    except subprocess.TimeoutExpired:
+    except OSError as exc:
+        out["error"] = _s("tailscale status failed to start: %s" % exc)
+        out["severity"] = "unknown"
+        return out
+    if proc.timed_out:
         out["error"] = "tailscale status timed out after %gs" % timeout
         out["severity"] = "unknown"
         return out
+    if proc.overflow:
+        out["error"] = ("tailscale status output exceeds %d bytes; rejected"
+                        % MAX_CHILD_BYTES)
+        out["severity"] = "unknown"
+        return out
     if proc.returncode != 0:
-        out["error"] = (proc.stderr or "tailscale status failed").strip()[:200]
+        out["error"] = _s((proc.stderr or "tailscale status failed").strip())
         out["severity"] = "unknown"
         return out
     try:
         status = json.loads(proc.stdout)
     except json.JSONDecodeError as exc:
-        out["error"] = "tailscale JSON unparsable: %s" % exc
+        out["error"] = _s("tailscale JSON unparsable: %s" % exc)
         out["severity"] = "unknown"
         return out
 
@@ -228,11 +383,13 @@ def probe_latency(nodes, timeout):
 
     def ping(node):
         try:
-            proc = subprocess.run(
+            proc = _run_bounded(
                 ["tailscale", "ping", "-c", "1",
                  "--timeout", "%gs" % timeout, node["ip"]],
-                capture_output=True, text=True, timeout=timeout + 2)
-        except (OSError, subprocess.TimeoutExpired):
+                timeout + 2, MAX_PING_BYTES)
+        except OSError:
+            return
+        if proc.timed_out or proc.overflow:
             return
         node["latencyMs"], node["path"] = parse_pong(proc.stdout)
 
@@ -313,22 +470,49 @@ def _url_allowed(url):
     return scheme in ("http", "https")
 
 
+def _http_get(url, timeout, max_bytes):
+    """Returns (body_bytes, error). Same-origin, http(s) only. A declared
+    Content-Length over the cap is refused before the body is touched; the
+    body is read in chunks and rejected outright (never truncated) the moment
+    it passes the cap. urllib's timeout is per socket operation, so the whole
+    transaction is additionally bounded by a wall-clock deadline checked
+    between chunks — the overrun is at most one socket timeout."""
+    if not _url_allowed(url):
+        return None, "metrics url must be http(s)"
+    deadline = time.monotonic() + timeout
+    try:
+        with _OPENER.open(url, timeout=timeout) as resp:
+            declared = resp.headers.get("Content-Length")
+            if declared is not None and declared.isdigit() \
+                    and int(declared) > max_bytes:
+                return None, "response declares %s bytes; cap is %d" % (
+                    declared, max_bytes)
+            buf = bytearray()
+            while True:
+                if time.monotonic() > deadline:
+                    return None, "response exceeded %gs deadline" % timeout
+                chunk = resp.read(65536)
+                if not chunk:
+                    break
+                buf += chunk
+                if len(buf) > max_bytes:
+                    return None, "response exceeds %d bytes; rejected" % max_bytes
+    except urllib.error.HTTPError as exc:
+        return None, "HTTP %s from %s" % (exc.code, _s(exc.reason, 80))
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        return None, _s("unreachable: %s" % getattr(exc, "reason", exc))
+    return bytes(buf), None
+
+
 def query_instant(base_url, query, timeout):
     """Returns (result_list, latency_ms, error). result_list is the raw
     vector `result` array from the API."""
     url = base_url.rstrip("/") + "/api/v1/query?" + urllib.parse.urlencode(
         {"query": query})
     started = time.monotonic()
-    if not _url_allowed(url):
-        return None, 0, "metrics url must be http(s)"
-    try:
-        with _OPENER.open(url, timeout=timeout) as resp:
-            body = resp.read(4 * 1024 * 1024)
-    except urllib.error.HTTPError as exc:
-        return None, _ms(started), "HTTP %s from %s" % (exc.code, exc.reason)
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        reason = getattr(exc, "reason", exc)
-        return None, _ms(started), "unreachable: %s" % reason
+    body, error = _http_get(url, timeout, MAX_HTTP_BYTES)
+    if error is not None:
+        return None, _ms(started), error
     try:
         doc = json.loads(body)
     except json.JSONDecodeError:
@@ -353,14 +537,13 @@ def query_range(base_url, query, span_sec, points, timeout):
     url = base_url.rstrip("/") + "/api/v1/query_range?" + urllib.parse.urlencode(
         {"query": query, "start": now - int(span_sec), "end": now,
          "step": step})
-    if not _url_allowed(url):
-        return None, "metrics url must be http(s)"
+    body, error = _http_get(url, timeout, MAX_RANGE_BYTES)
+    if error is not None:
+        return None, error
     try:
-        with _OPENER.open(url, timeout=timeout) as resp:
-            body = resp.read(8 * 1024 * 1024)
         doc = json.loads(body)
     except Exception as exc:  # history is decoration; any failure degrades soft
-        return None, str(exc)[:200]
+        return None, _s(str(exc))
     if doc.get("status") != "success":
         return None, str(doc.get("error") or "range query failed")[:200]
     data = doc.get("data") or {}
@@ -695,6 +878,29 @@ def attach_node_stats(peers, stats, aliases):
 # ---------------------------------------------------------------------------
 # Report
 
+def _bound(value, depth=0):
+    """Final gate on the report: every string capped, every array and object
+    count-capped, nesting depth capped, non-finite numbers dropped. Applied
+    to the whole document so no field — whatever produced it — can exceed
+    the budget the QML side is written for."""
+    if depth > MAX_DEPTH:
+        return None
+    if isinstance(value, str):
+        return value[:MAX_STR]
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, (list, tuple)):
+        return [_bound(v, depth + 1) for v in list(value)[:MAX_LIST]]
+    if isinstance(value, dict):
+        return {str(k)[:64]: _bound(v, depth + 1)
+                for k, v in list(value.items())[:MAX_KEYS]}
+    return _s(value)
+
+
 def build_report(config_path):
     started = time.monotonic()
     cfg, cfg_error = load_config(config_path)
@@ -732,15 +938,15 @@ def build_report(config_path):
     if (not tailscale["ok"] and tailscale["enabled"]) or cfg_error:
         issue_counts["unknown"] += 1
 
-    return {
+    return _bound({
         "version": 1,
         "generatedAt": int(time.time()),
         "durationMs": _ms(started),
-        "fleetName": str(cfg.get("fleetName") or "Fleet"),
-        "dashboardUrl": str(cfg.get("dashboardUrl") or ""),
-        "sshCommand": str(cfg.get("sshCommand") or "ssh {name}"),
-        "configPath": config_path,
-        "configError": cfg_error,
+        "fleetName": _s(cfg.get("fleetName") or "Fleet", 64),
+        "dashboardUrl": _s(cfg.get("dashboardUrl") or ""),
+        "sshCommand": _s(cfg.get("sshCommand") or "ssh {name}"),
+        "configPath": _s(config_path),
+        "configError": _s(cfg_error) if cfg_error else None,
         "tailscale": tailscale,
         "vm": vm,
         "checks": checks,
@@ -753,7 +959,7 @@ def build_report(config_path):
             "peersOnline": tailscale["online"],
             "peersTotal": tailscale["total"],
         },
-    }
+    })
 
 
 def main(argv=None):
@@ -763,6 +969,11 @@ def main(argv=None):
     parser.add_argument("--pretty", action="store_true",
                         help="indent the JSON output")
     args = parser.parse_args(argv)
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        try:
+            signal.signal(sig, _on_terminate)
+        except (ValueError, OSError):
+            pass  # not the main thread / unsupported: children still die on deadline
     report = build_report(os.path.expanduser(args.config))
     json.dump(report, sys.stdout, indent=2 if args.pretty else None)
     sys.stdout.write("\n")
