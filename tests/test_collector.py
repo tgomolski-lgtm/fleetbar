@@ -77,6 +77,28 @@ class TailscaleTests(unittest.TestCase):
         out = self.collect({"expect": ["nas"], "offlineSeverity": "crit"})
         self.assertEqual(out["severity"], "crit")
 
+    def test_active_fresh_handshake_counts_as_online(self):
+        import datetime as dt
+        now = dt.datetime.now(dt.timezone.utc)
+        fresh = (now - dt.timedelta(seconds=30)).isoformat()
+        stale = (now - dt.timedelta(hours=2)).isoformat()
+        peers = {"Self": TS_FIXTURE["Self"], "Peer": {
+            "a": {"HostName": "nas-live", "TailscaleIPs": ["100.1.1.1"],
+                  "OS": "linux", "Online": False, "Active": True,
+                  "LastHandshake": fresh},
+            "b": {"HostName": "nas-stale", "TailscaleIPs": ["100.1.1.2"],
+                  "OS": "linux", "Online": False, "Active": True,
+                  "LastHandshake": stale},
+            "c": {"HostName": "nas-inactive", "TailscaleIPs": ["100.1.1.3"],
+                  "OS": "linux", "Online": False, "Active": False,
+                  "LastHandshake": fresh},
+        }}
+        out = self.collect({"expect": ["nas-"]}, payload=peers)
+        by = {p["name"]: p["online"] for p in out["peers"]}
+        self.assertTrue(by["nas-live"])
+        self.assertFalse(by["nas-stale"])
+        self.assertFalse(by["nas-inactive"])
+
     def test_cli_failure_is_unknown_not_ok(self):
         out = self.collect({}, payload="", returncode=1, stderr="boom")
         self.assertFalse(out["ok"])

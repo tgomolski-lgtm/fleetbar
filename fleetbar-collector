@@ -151,7 +151,8 @@ def collect_tailscale(ts_cfg):
         name = dns.split(".")[0] if dns else _s(node.get("HostName")) or "?"
         ips = [ip for ip in (node.get("TailscaleIPs") or [])[:16]
                if _valid_ipv4(ip)]
-        online = bool(node.get("Online")) or is_self
+        online = bool(node.get("Online")) or is_self \
+            or _recent_handshake(node)
         return {
             "name": _s(name, 64),
             "host": _s(node.get("HostName") or name, 64),
@@ -239,6 +240,23 @@ def probe_latency(nodes, timeout):
         return
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
         list(pool.map(ping, targets))
+
+
+def _recent_handshake(node, max_age=600):
+    """Some clients (the UGREEN NAS build, for one) never report Online=true
+    to the control plane yet hold a live tunnel. Treat Active plus a
+    handshake inside max_age seconds as online; anything else stays offline."""
+    if not node.get("Active"):
+        return False
+    raw = str(node.get("LastHandshake") or "")
+    if not raw or raw.startswith("0001-"):
+        return False
+    try:
+        then = datetime.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    age = (datetime.datetime.now(datetime.timezone.utc) - then).total_seconds()
+    return 0 <= age <= max_age
 
 
 def humanize_since(iso_ts):
